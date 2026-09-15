@@ -50,7 +50,7 @@ LABEL org.opencontainers.image.created="${BUILD_DATE}" \
       ai.vllm.flashqla.commit="${ONECAT_FLASHQLA_COMMIT}" \
       ai.vllm.sm75.release="${VLLM_SM75_RELEASE}"
 
-COPY vllm/envs.py /tmp/sm75-overlay/envs.py
+COPY vllm/envs_sm75.py /tmp/sm75-overlay/envs_sm75.py
 COPY vllm/device_allocator/disk_snapshot.py /tmp/sm75-overlay/device_allocator/disk_snapshot.py
 COPY vllm/device_allocator/disk_sleep.py /tmp/sm75-overlay/device_allocator/disk_sleep.py
 COPY vllm/config/model.py /tmp/sm75-overlay/config/model.py
@@ -98,6 +98,8 @@ COPY vllm/v1/engine/async_llm.py \
     /tmp/sm75-overlay/v1/engine/async_llm.py
 COPY vllm/v1/engine/core_client.py \
     /tmp/sm75-overlay/v1/engine/core_client.py
+COPY vllm/v1/core/sched/scheduler_sm75.py \
+    /tmp/sm75-overlay/v1/core/sched/scheduler_sm75.py
 COPY vllm/third_party/flash_qla_sm75 \
     /tmp/sm75-overlay/third_party/flash_qla_sm75
 COPY docker/install_sm75_overlay.py /tmp/install_sm75_overlay.py
