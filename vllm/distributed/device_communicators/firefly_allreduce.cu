@@ -95,6 +95,23 @@ __device__ __forceinline__ uint64_t ld_acquire_sys_u64(const uint64_t* p) {
   return v;
 }
 
+// ---- GPU 自旋等待 + 有界 backoff (失锁步时不占满 SM) ----
+// 正常锁步 (vllm forward 两 rank 同层同 allreduce): 命中前自旋次数远小于阈值,
+//   不进 backoff, 开销 ~0。
+// 失锁步 (某 rank 被 CPU 侧拖慢): 连续未命中达阈值后 __nanosleep, 释放 SM,
+//   避免纯忙等把 nvidia-smi util 顶到 100%; peer 回来后仍微秒级重试快速响应。
+// 语义与裸自旋完全等价 (release/acquire 由 st/ld 保证, backoff 只是"未命中时
+//   睡一会儿"); 不引入 CPU-GPU 同步 / 回退, 保持 cudagraph capture 安全。
+__device__ __forceinline__ void spin_wait_until_eq_sys(const uint64_t* p,
+                                                       uint64_t expect) {
+  int spins = 0;
+  while (ld_acquire_sys_u64(p) != expect) {
+    if (++spins >= 128) {
+      __nanosleep(1000);
+    }
+  }
+}
+
 // fp8 转换 (sm75 无 fp8 硬件, CUDA 原生软转; c10 device 路径实测坏)
 __device__ __forceinline__ uint8_t quant_to_fp8(float v) {
   return __nv_cvt_float_to_fp8(v, __NV_SATFINITE, __NV_E4M3);
@@ -134,8 +151,7 @@ __global__ void ar_scale_exchange(char* __restrict__ shm_base,
         reinterpret_cast<uint64_t*>(base + 2 * data_half + 8);
     amax_shm[rank] = local_amax;                       // 写本端 amax
     st_release_sys_u64(flag_scale + rank, seq);         // 发布 (release)
-    while (ld_acquire_sys_u64(flag_scale + (1 - rank)) != seq) {
-    }                                                  // 等对端 (acquire)
+    spin_wait_until_eq_sys(flag_scale + (1 - rank), seq);  // 等对端 (acquire)
     float peer_amax = amax_shm[1 - rank];
     *scale_dev = fmaxf(local_amax, peer_amax) / 448.0f;  // e4m3fn max finite
   }
@@ -165,8 +181,7 @@ __global__ void ar_scale_exchange_p2p(char* __restrict__ own_base,
         reinterpret_cast<uint64_t*>(peer_base + 2 * data_half + 8);
     *own_amax = local_amax;                        // 写本端 amax
     st_release_sys_u64(own_flag, seq);             // 发布 (release)
-    while (ld_acquire_sys_u64(peer_flag) != seq) {
-    }                                              // 等对端 (acquire)
+    spin_wait_until_eq_sys(peer_flag, seq);        // 等对端 (acquire)
     *scale_dev = fmaxf(local_amax, *peer_amax) / 448.0f;
   }
 }
@@ -203,8 +218,7 @@ __global__ void ar_scale_exchange_n(char** __restrict__ bases_dev,
       char* peer = bases_dev[r];
       uint64_t* peer_flag =
           reinterpret_cast<uint64_t*>(peer + world * data_half + 8);
-      while (ld_acquire_sys_u64(peer_flag) != seq) {
-      }                                              // 等其余卡 (acquire)
+      spin_wait_until_eq_sys(peer_flag, seq);        // 等其余卡 (acquire)
       float pa = *reinterpret_cast<float*>(peer + world * data_half);
       if (pa > global_amax) global_amax = pa;
     }
@@ -234,8 +248,7 @@ __global__ void ar_scale_exchange_n_shm(char* __restrict__ shm_base,
     float global_amax = local_amax;
     for (int64_t r = 0; r < world; ++r) {
       if (r == rank) continue;
-      while (ld_acquire_sys_u64(flag_arr + r) != seq) {
-      }                                         // 等其余卡 (acquire)
+      spin_wait_until_eq_sys(flag_arr + r, seq);  // 等其余卡 (acquire)
       float pa = amax_arr[r];
       if (pa > global_amax) global_amax = pa;
     }
@@ -272,8 +285,7 @@ __global__ void ar_set_spin(uint64_t* __restrict__ my_flag,
   if (threadIdx.x == 0 && blockIdx.x == 0) {
     uint64_t seq = *seq_dev;
     st_release_sys_u64(my_flag, seq);
-    while (ld_acquire_sys_u64(peer_flag) != seq) {
-    }
+    spin_wait_until_eq_sys(peer_flag, seq);
   }
 }
 
