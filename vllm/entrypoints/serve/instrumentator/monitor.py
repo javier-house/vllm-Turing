@@ -13,6 +13,7 @@ HTML 独立成 dashboard.html, 可直接用浏览器打开看样式; 每次请�
 import hashlib
 import os
 import secrets
+import subprocess
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -34,6 +35,85 @@ def _monitor_enabled() -> bool:
         return bool(envs.VLLM_MONITOR)
     except AttributeError:
         return os.environ.get("VLLM_MONITOR", "1").strip().lower() not in _OFF_VALUES
+
+
+def _query_gpus() -> dict:
+    """nvidia-smi 一次性采集所有 GPU 的瞬时状态(无状态, 每次调用现采)。
+
+    返回 {ok:bool, gpus:[{...}], error:str}。前端 /monitor/gpu 轮询本端点
+    拿 GPU 监控数据(温度/显存/功率/频率/PCIe/带宽/ECC/利用率)。
+
+    失败(无 nvidia-smi / 非 NVIDIA / 超时 / 解析异常)时返回 {ok:False,
+    gpus:[], error:msg}, 前端据此降级为「GPU 数据不可用」, 绝不抛到路由层
+    拖垮 /monitor。nvidia-smi 是 NVIDIA 容器运行时的标准入口, vllm 容器内
+    只要 host 装了驱动即可用, 无需额外权限。
+    """
+    fields = [
+        "index", "name",
+        "temperature.gpu",
+        "memory.used", "memory.total",
+        "power.draw", "power.limit",
+        "clocks.current.graphics", "clocks.current.memory",
+        "pcie.link.gen.current", "pcie.link.gen.max",
+        "pcie.link.width.current", "pcie.link.width.max",
+        "utilization.gpu", "utilization.memory",
+        "ecc.errors.corrected.volatile.total",
+        "ecc.errors.uncorrected.volatile.total",
+    ]
+    cmd = [
+        "nvidia-smi",
+        f"--query-gpu={','.join(fields)}",
+        "--format=csv,noheader,nounits",
+    ]
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=5
+        )
+    except FileNotFoundError:
+        return {"ok": False, "gpus": [], "error": "nvidia-smi not found"}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "gpus": [], "error": "nvidia-smi timeout"}
+    except Exception as exc:  # noqa: BLE001 - 任何异常都降级, 不让路由崩
+        return {"ok": False, "gpus": [], "error": f"nvidia-smi error: {exc}"}
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip()
+        # 截断避免长报错灌进看板
+        return {"ok": False, "gpus": [], "error": err[:200] or f"exit {proc.returncode}"}
+    gpus: list[dict] = []
+    for line in proc.stdout.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) != len(fields):
+            continue
+        row = dict(zip(fields, parts))
+
+        def _num(key: str):
+            try:
+                return float(row[key])
+            except (ValueError, KeyError):
+                return None
+
+        gpus.append({
+            "index": int(_num("index") or 0),
+            "name": row.get("name") or "GPU",
+            "temp": _num("temperature.gpu"),
+            "mem_used": _num("memory.used"),
+            "mem_total": _num("memory.total"),
+            "power": _num("power.draw"),
+            "power_limit": _num("power.limit"),
+            "clk_g": _num("clocks.current.graphics"),
+            "clk_m": _num("clocks.current.memory"),
+            "pcie_gen": _num("pcie.link.gen.current"),
+            "pcie_gen_max": _num("pcie.link.gen.max"),
+            "pcie_width": _num("pcie.link.width.current"),
+            "pcie_width_max": _num("pcie.link.width.max"),
+            "util": _num("utilization.gpu"),
+            "mem_bw": _num("utilization.memory"),
+            "ecc_s": _num("ecc.errors.corrected.volatile.total"),
+            "ecc_d": _num("ecc.errors.uncorrected.volatile.total"),
+        })
+    if not gpus:
+        return {"ok": False, "gpus": [], "error": "no GPU parsed"}
+    return {"ok": True, "gpus": gpus, "error": ""}
 
 
 def _configured_api_keys(request: Request) -> list[str]:
@@ -89,6 +169,15 @@ def attach_router(app: FastAPI) -> None:
     @app.get("/monitor", response_class=HTMLResponse, include_in_schema=False)
     def monitor() -> HTMLResponse:  # noqa: N802
         return HTMLResponse(_DASHBOARD_HTML_PATH.read_text(encoding="utf-8"))
+
+    @app.get("/monitor/gpu", include_in_schema=False)
+    async def get_gpu() -> JSONResponse:  # noqa: N802
+        """只读, 无鉴权(与 /metrics 一致)。前端 GPU 监控部件轮询本端点。
+
+        每次现调 nvidia-smi 采一次(无状态, 不缓存), 前端负责累加温度/功率
+        history 画曲线。失败时 ok=False, 前端降级不报错。
+        """
+        return JSONResponse(_query_gpus())
 
     @app.get("/monitor/spec_decode", include_in_schema=False)
     async def get_spec_decode(request: Request) -> JSONResponse:  # noqa: N802
