@@ -6,29 +6,7 @@
 
 vLLM-SM75 v0.1.4 基于 vLLM 0.29.0，集成 MTP、DFlash2 和自动休眠适配。
 
-## v0.1.4 更新简要
-
-- **Firefly prefill 加速**：提升 AWQ INT4 长文本处理吞吐。
-- **FP8 all-reduce 优化**：降低多卡通信开销，提升 prefill 性能。
-- **自动休眠适配**：保留低功耗待机与自动唤醒，加固并发处理。
-- **新增 `/monitor` 看板**：直接查看运行状态和性能指标。
-- **跟进 vLLM 0.29.0 适配**。
-
-### 兼容性修复
-
-- 修复 DFlash2 权重加载和主模型/草稿 KV 布局的新版接口兼容问题。
-- 修复 CPU KV 缓存组识别，避免将主模型组误判为草稿组；补充 DFlash2 输入准备和采样预热。
-- 完善 Triton 与扩展编译缓存挂载，保留 v0.1.3 已有的主模型、草稿和候选选择器缓存复用能力。
-
-详细变化与验证范围见[发布说明](docs/releases/v0.1.4.zh-CN.md)。
-
-## v0.1.3 更新简要
-
-- 新增空闲自动休眠与透明唤醒，启动脚本默认空闲 30 分钟后进入深度休眠。
-- 修正空闲计时起点，从请求完成并进入 idle 状态后开始计时。
-- 同版本修复 sleep 参数及引擎重建导致的编译缓存失效，DFlash2 草稿与候选选择器也复用缓存；镜像仍为 `vllm-sm75:v0.1.3`。
-
-## 功能要点
+## 增强功能简要
 
 - FlashQLA-SM75 GDN prefill、Triton decode、FlashInfer 0.6.18、Marlin FP8 和 FP8 KV。
 - SM75 CUDA Graph、GDN 状态准备融合及原生 MTP5 验证路径。
@@ -37,53 +15,9 @@ vLLM-SM75 v0.1.4 基于 vLLM 0.29.0，集成 MTP、DFlash2 和自动休眠适配
 - 统一镜像支持普通推理、MTP5 和 DFlash2，通过启动参数选择模式。
 - 空闲自动睡眠支持 CPU、reload 和 exit；exit 模式释放引擎进程、CUDA context、worker 和显存，下一请求透明冷启动。
 
-## 性能参考
-
-### v0.1.4 prefill 优化实测
-
-4 × Tesla T10 16 GiB，TP4，DFlash2 draft7。以下为PR兼容修补镜像的单轮合成测试，各输出512 tokens，无前缀命中；prefill按输入tokens/首字时间计算。
-
-| 配置 | 输入 | prefill（tok/s） | decode（tok/s） | 首字时间（秒） |
-| --- | ---: | ---: | ---: | ---: |
-| FP8 DFlash2 | 32K | 1205.85 | 179.12 | 27.17 |
-| FP8 DFlash2 | 128K | 978.19 | 166.39 | 133.99 |
-| AWQ DFlash2 | 32K | 1433.67 | 215.57 | 22.86 |
-| AWQ DFlash2 | 128K | 1124.88 | 198.40 | 116.52 |
-
-FP8 1–64K prefill相比已保存v0.1.3基线提升约3.8%–5.3%，8–64K decode基本持平；本次优化重点是 **prefill**。AWQ没有同口径旧版对照，不给出提升百分比。AWQ与FP8参数不同，表格不作为量化格式的同参数对照；重复文本的高草稿接受率也不代表日常聊天速度。
-
-[FP8完整数据](docs/validation/v0.1.4.md) · [AWQ完整数据](docs/validation/v0.1.4-awq.md) · [AWQ推荐配置](docs/recommended-awq-dflash2.md)
-
-### 历史基础性能（v0.1.2）
-
-测试环境：vLLM-SM75 v0.1.2，4 × Tesla T10 16 GiB、TP4、PCIe 3.0 ×8、CUDA 12.9、PyTorch 2.13.0、FlashInfer 0.6.18。
-
-Qwen3.8-27B FP8 / W4A16-AWQ：重复说明文本并要求生成 Python 工具，单请求、1024 输出 tokens、temperature=0、关闭 thinking、无前缀缓存命中。输入长度包含聊天模板；以下为各配置、各长度的单次验收实测。
-
-| 配置        | 输入 tokens | TTFT（秒） | decode（tok/s） | 总耗时（秒） |
-| :---------- | ----------: | ---------: | --------------: | -----------: |
-| FP8 普通    |        1173 |      1.823 |           37.51 |       29.094 |
-| FP8 普通    |       36885 |     35.434 |           35.62 |       64.152 |
-| FP8 MTP5    |        1173 |      3.035 |           83.76 |       15.248 |
-| FP8 MTP5    |       36885 |     36.400 |           76.41 |       49.789 |
-| FP8 DFlash2 |        1173 |      1.154 |           98.12 |       11.581 |
-| FP8 DFlash2 |       36885 |     35.002 |          113.81 |       43.990 |
-| AWQ 普通    |        1173 |      1.903 |           52.16 |       21.515 |
-| AWQ 普通    |       36885 |     34.337 |           48.55 |       55.410 |
-| AWQ MTP5    |        1173 |      2.856 |           97.27 |       13.373 |
-| AWQ MTP5    |       36885 |     34.988 |           99.80 |       45.239 |
-| AWQ DFlash2 |        1173 |      1.156 |          122.51 |        9.507 |
-| AWQ DFlash2 |       36885 |     34.106 |          140.84 |       41.369 |
-
-TTFT 为首个文本输出等待时间，decode 不含 prefill。各配置的显存预算与启动参数见[测试配置](docs/validation/v0.1.2.md#测试配置)。
-
-历史 FP8 DFlash7 重复文本压力测试：seq4、batch8192、1024 输出 tokens，32K decode 中位数 **147.70 tok/s**，单轮最高 **151.28 tok/s**，接受率接近 100%；详细条件见[更新说明](docs/releases/v0.1.2.zh-CN.md)。
-
-实际场景复杂，性能随硬件、模型、请求内容和配置变化，未达到测试数据是正常现象。
-
 ## 快速复现
 
-v0.1.2 的基础推理验收见[验证记录](docs/validation/v0.1.2.md)；v0.1.3 新增自动休眠测试。
+v0.1.2 的基础推理验收、v0.1.3 新增自动休眠测试。
 
 ### 编译缓存持久化
 
@@ -136,15 +70,13 @@ DRAFT_MODEL=/models/Qwen3.8-27B-DFlash2 VARIANT=dflash2 FORMAT=fp8 \
 ```
 
 DFlash draft 使用 `incoai/Qwen3.8-27B-DFlash2`，完整模型文件放入上述挂载目录。
-AWQ 使用 `philbert440/Qwen3.8-27B-W4A16-AWQ`，下载后设置 `MODEL=/models/Qwen3.8-27B-W4A16-AWQ FORMAT=awq`。其余配置见[构建与启动说明](docker/BUILD-v0.1.4.md)。
+AWQ 使用 `philbert440/Qwen3.8-27B-W4A16-AWQ`，下载后设置 `MODEL=/models/Qwen3.8-27B-W4A16-AWQ FORMAT=awq`。
 
 ```bash
 curl --fail http://localhost:8000/health
 curl --fail http://localhost:8000/v1/models \
   --header "Authorization: Bearer $VLLM_API_KEY"
 ```
-
-已完成本地 GPU 验证的配置、可复制的完整命令与实测效果见[FP8 DFlash2 推荐配置](docs/recommended-fp8-dflash2.md)。
 
 ## Firefly
 
@@ -220,7 +152,7 @@ exit 只在退出前提示预热主模型文件页，没有后台预热进程。
 
 **FP8 DFlash2 + 30 分钟 exit**：4 × Tesla T10 16 GiB、TP4、约 31 GiB 主机 RAM，CPU 使用 ondemand。主模型 `Qwen/Qwen3.8-27B-FP8`，草稿 `incoai/Qwen3.8-27B-DFlash2`。
 
-推理参数保持：**draft7、Graph `[8]`、seq4、batch8192、utilization 0.92、max-model-len 262144、每卡 KV 3288334336 bytes、FP8 e4m3 KV、8 GiB CPU KV offload**。这些显存预算针对该四卡环境；完整命令见[推荐配置](docs/recommended-fp8-dflash2.md)。
+推理参数保持：**draft7、Graph `[8]`、seq4、batch8192、utilization 0.92、max-model-len 262144、每卡 KV 3288334336 bytes、FP8 e4m3 KV、8 GiB CPU KV offload**。这些显存预算针对该四卡环境。
 
 | 项目 | 本地实测结果 |
 | --- | --- |
