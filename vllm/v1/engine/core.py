@@ -1735,8 +1735,46 @@ class EngineCoreProc(EngineCore):
             "[deep-sleep] EngineCore: idle timeout reached; exiting process. "
             "The client will respawn the engine on the next request."
         )
+        self._destroy_nccl_symmetric_for_exit()
         self._send_deep_sleep_exiting()
         self.shutdown_state = EngineShutdownState.REQUESTED
+
+    def _destroy_nccl_symmetric_for_exit(self) -> None:
+        """Deep-sleep exit: 主线程统一经 collective_rpc(barrier 语义)驱动全部
+        worker 对称销毁 NCCL process group。
+
+        PP(跨 stage P2P)下 NCCL 对称握手时序敏感; 若只靠 shutdown 的被动
+        SIGTERM + 短 grace, PP worker 可能在握手走不完时被 SIGKILL 砍断, 卡在
+        P2P 死锁(CPU 100%)占死显存, 使后续 respawn 反复失败。这里在 exit 时
+        主动、全员同步地 destroy, 对称握手天然全员在场。之后 shutdown 的
+        worker finally 再 destroy 一次是 no-op(destroy 幂等)。
+        仅解 NCCL process group, 不碰 MQ/不退出进程(那是 shutdown 的活)。
+        """
+        def _destroy_nccl(_worker):
+            # 闭包经 cloudpickle 序列化到各 worker 进程执行, import 必须内联。
+            from vllm.distributed.parallel_state import (
+                destroy_distributed_environment,
+                destroy_model_parallel,
+            )
+
+            destroy_model_parallel()
+            destroy_distributed_environment()
+            return True
+
+        try:
+            self.model_executor.collective_rpc(
+                _destroy_nccl, timeout=60.0
+            )
+            logger.info(
+                "[deep-sleep] EngineCore: NCCL process groups destroyed "
+                "symmetrically before exit"
+            )
+        except Exception:
+            logger.warning(
+                "[deep-sleep] EngineCore: symmetric NCCL destroy failed; "
+                "falling back to shutdown grace period",
+                exc_info=True,
+            )
 
     def _make_ready_response(self) -> EngineCoreReadyResponse:
         parallel_config = self.vllm_config.parallel_config

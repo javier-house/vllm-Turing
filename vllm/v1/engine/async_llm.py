@@ -90,9 +90,11 @@ VLLM_SM75_RESPAWN_GPU_WAIT_S = float(
 )
 # Wall-clock cap for a single respawn attempt (model load + ready wait).  The
 # model-load step (asyncio.to_thread) has no built-in timeout and can stall on
-# a slow disk; this bounds it so one stuck load cannot hang the gate forever.
+# a slow disk; this bounds it so one stuck load cannot hold the gate (and
+# spawn orphan workers) for an hour.  A PP2TP4 cold start was measured ~120s,
+# so 600s leaves ~5x headroom while still bounding a genuinely stuck load.
 VLLM_SM75_RESPAWN_ATTEMPT_TIMEOUT_S = float(
-    os.environ.get("VLLM_SM75_RESPAWN_ATTEMPT_TIMEOUT_S", "3600")
+    os.environ.get("VLLM_SM75_RESPAWN_ATTEMPT_TIMEOUT_S", "600")
 )
 # Wall-clock cap for the whole retry loop.  A backstop so a bad respawn cycle
 # cannot hold the gate (and every request behind it) for an unbounded time.
@@ -1426,6 +1428,60 @@ class AsyncLLM(EngineClient):
         )
         raise EngineDeadError() from last_exc
 
+    @staticmethod
+    def _kill_orphan_workers(timeout: float = 10.0) -> int:
+        """按进程名清扫残留的 VLLM worker 子进程 (respawn 失败的孤儿)。
+
+        respawn_engine 经 asyncio.to_thread(self._respawn_launch) 跑, 被
+        wait_for 超时 cancel 后线程杀不掉, 它 spawn 出的 worker 子进程成为孤儿,
+        卡在 NCCL P2P 死锁(CPU 100%)占死显存; 这些 worker 对 SIGTERM 无响应
+        (卡在 C++ NCCL 层), 必须 SIGKILL。
+        按 /proc/pid/comm (psutil name) 以 "VLLM::Worker" 前缀匹配——实测 worker
+        的 comm 被 setup_proc_title 改为 "VLLM::Worker_PP"/"VLLM::Worker_TP",
+        cmdline 可能已清空, 故按 name 而非 cmdline; 只命中 worker, 不命中
+        EngineCore("VLLM::EngineCore")/APIServer。先 SIGTERM 给短暂优雅退出机会,
+        超时残留 SIGKILL。返回清扫的进程数 (0=无残留)。
+        """
+        import psutil
+
+        victims: list[Any] = []
+        try:
+            for proc in psutil.process_iter(["name"]):
+                try:
+                    name = proc.info.get("name") or ""
+                    if name.startswith("VLLM::Worker") and proc.pid != os.getpid():
+                        victims.append(proc)
+                except (
+                    psutil.NoSuchProcess,
+                    psutil.AccessDenied,
+                    psutil.ZombieProcess,
+                ):
+                    continue
+        except Exception as e:  # noqa: BLE001 - scan 失败不应阻断 reap
+            logger.warning("[deep-sleep] orphan worker scan failed: %s", e)
+            return 0
+        if not victims:
+            return 0
+        for proc in victims:
+            try:
+                proc.terminate()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        alive, _ = psutil.wait_procs(victims, timeout=timeout)
+        killed = 0
+        for proc in alive:
+            try:
+                proc.kill()
+                killed += 1
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        logger.info(
+            "[deep-sleep] reaped %d orphan worker(s) (%d required SIGKILL)",
+            len(victims),
+            killed,
+        )
+        return len(victims)
+
     async def _reap_orphan_engine(self) -> None:
         """Shut down engine processes left behind by a failed respawn.
 
@@ -1437,17 +1493,26 @@ class AsyncLLM(EngineClient):
         ``monitor_engine_liveness()``.  ``shutdown()`` terminates that process,
         which is what unblocks the monitor; the two operate on the same process
         lifecycle (the manager serializes terminate/join), so this is safe.
+
+        vllm-sm75 overlay: engine_manager.shutdown() only knows the *current*
+        round's manager (it is overwritten each launch_core_engines) and cannot
+        reach a worker wedged in an NCCL P2P deadlock (SIGTERM-unresponsive),
+        so it is followed by a process-name sweep of any residual VLLM workers
+        (covers cross-round orphans the manager has lost track of).
         """
+
         def _shutdown() -> None:
             manager = getattr(self.engine_core.resources, "engine_manager", None)
-            if manager is None:
-                return
-            try:
-                manager.shutdown(timeout=30)
-            except Exception as e:  # noqa: BLE001 - best effort cleanup
-                logger.warning(
-                    "[deep-sleep] orphan engine cleanup failed: %s", e
-                )
+            if manager is not None:
+                try:
+                    manager.shutdown(timeout=30)
+                except Exception as e:  # noqa: BLE001 - best effort cleanup
+                    logger.warning(
+                        "[deep-sleep] orphan engine cleanup failed: %s", e
+                    )
+            # 兜底: engine_manager 只管当轮且杀不掉 NCCL 死锁 worker, 按进程名
+            # 清扫所有残留 worker (含跨轮孤儿)。
+            self._kill_orphan_workers()
 
         await asyncio.to_thread(_shutdown)
 
