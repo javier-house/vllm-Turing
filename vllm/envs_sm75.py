@@ -186,6 +186,11 @@ def apply() -> None:
             factors = _orig()
             for key in INSTALL_IGNORED:
                 factors.pop(key, None)
+            # 监控看板只挂 HTTP 路由, 不影响编译图; 沿用"monitor 关"的历史缓存
+            # 签名, 使开/关 UI 都能复用既有生产编译产物。不改 getter: 监控实际仍按
+            # VLLM_MONITOR 原值生效, 这里只归一化 hash 因子。
+            if "VLLM_MONITOR" in factors:
+                factors["VLLM_MONITOR"] = False
             return factors
 
         _compile_factors_sm75._sm75_wrapped = True  # type: ignore[attr-defined]

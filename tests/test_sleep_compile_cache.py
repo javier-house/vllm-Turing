@@ -66,6 +66,7 @@ class SleepCompileCacheTests(unittest.TestCase):
             "VLLM_AUTO_SLEEP_RELOAD_PATH",
             "VLLM_AUTO_SLEEP_PAGE_CACHE_KEEP_INTERVAL",
             "VLLM_USE_LAYERNAME",
+            "VLLM_MONITOR",
         ]
         fake_envs.environment_variables = {
             n: fake_envs.environment_variables[n] for n in names
@@ -107,6 +108,17 @@ class SleepCompileCacheTests(unittest.TestCase):
             self.cache_key(VLLM_USE_LAYERNAME="0"),
             self.cache_key(VLLM_USE_LAYERNAME="1"),
         )
+
+    def test_monitor_toggle_preserves_legacy_cache_without_disabling_ui(self):
+        reference = self.cache_key(VLLM_MONITOR="0")
+        self.assertEqual(reference, self.cache_key(VLLM_MONITOR="1"))
+        with patch.dict(os.environ, {"VLLM_MONITOR": "1"}):
+            legacy = self.envs.compile_factors.__wrapped__()
+            legacy["VLLM_MONITOR"] = False
+            for name in _load_envs_sm75().INSTALL_IGNORED:
+                legacy.pop(name, None)
+            self.assertEqual(legacy, self.envs.compile_factors())
+            self.assertTrue(self.envs.environment_variables["VLLM_MONITOR"]())
 
 
 if __name__ == "__main__":
