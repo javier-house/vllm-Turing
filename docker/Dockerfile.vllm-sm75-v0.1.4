@@ -53,33 +53,19 @@ LABEL org.opencontainers.image.created="${BUILD_DATE}" \
 COPY vllm/envs_sm75.py /tmp/sm75-overlay/envs_sm75.py
 COPY vllm/device_allocator/disk_snapshot.py /tmp/sm75-overlay/device_allocator/disk_snapshot.py
 COPY vllm/device_allocator/disk_sleep.py /tmp/sm75-overlay/device_allocator/disk_sleep.py
-COPY vllm/config/model.py /tmp/sm75-overlay/config/model.py
-COPY vllm/config/compilation.py /tmp/sm75-overlay/config/compilation.py
 COPY vllm/engine/arg_utils.py /tmp/sm75-overlay/engine/arg_utils.py
-COPY vllm/entrypoints/serve/utils/api_utils.py \
-    /tmp/sm75-overlay/entrypoints/serve/utils/api_utils.py
-COPY vllm/entrypoints/serve/instrumentator/metrics.py \
-    /tmp/sm75-overlay/entrypoints/serve/instrumentator/metrics.py
 COPY vllm/entrypoints/serve/instrumentator/monitor.py \
     /tmp/sm75-overlay/entrypoints/serve/instrumentator/monitor.py
 COPY vllm/entrypoints/serve/instrumentator/dashboard.html \
     /tmp/sm75-overlay/entrypoints/serve/instrumentator/dashboard.html
-COPY vllm/distributed/kv_transfer/kv_connector/v1/base.py \
-    /tmp/sm75-overlay/distributed/kv_transfer/kv_connector/v1/base.py
 COPY vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py \
     /tmp/sm75-overlay/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
-COPY vllm/model_executor/layers/quantization/kv_cache.py \
-    /tmp/sm75-overlay/model_executor/layers/quantization/kv_cache.py
-COPY vllm/model_executor/layers/quantization/utils/marlin_utils_fp8.py \
-    /tmp/sm75-overlay/model_executor/layers/quantization/utils/marlin_utils_fp8.py
 COPY vllm/v1/attention/backends/flashinfer.py \
     /tmp/sm75-overlay/v1/attention/backends/flashinfer.py
 COPY vllm/v1/attention/backends/gdn_attn.py \
     /tmp/sm75-overlay/v1/attention/backends/gdn_attn.py
 COPY vllm/model_executor/kernels/linear/mixed_precision/marlin.py \
     /tmp/sm75-overlay/model_executor/kernels/linear/mixed_precision/marlin.py
-COPY vllm/model_executor/kernels/linear/scaled_mm/marlin.py \
-    /tmp/sm75-overlay/model_executor/kernels/linear/scaled_mm/marlin.py
 COPY vllm/model_executor/layers/quantization/utils/firefly.py \
     /tmp/sm75-overlay/model_executor/layers/quantization/utils/firefly.py
 COPY vllm/model_executor/layers/quantization/utils/firefly.cu \
