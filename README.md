@@ -1,10 +1,15 @@
-# vLLM-SM75
-
-[简体中文](README.md) | [English](README.en.md)
+# vllm-Turing
 
 持续同步官方 [vLLM](https://github.com/vllm-project/vllm)，完善 SM75 兼容支持与内核优化。
 
-vLLM-SM75 v0.1.4 基于 vLLM 0.29.0，集成 MTP、DFlash2 和自动休眠适配。
+本项目基于 vLLM 0.29.0，集成 MTP、DFlash2 和自动休眠适配。
+
+## 关于本项目
+
+一个出于兴趣的项目：为图灵架构（SM75）显卡提升 vLLM 的推理速度。项目在原生 vLLM 之上叠加上游相关优化，并进一步适配图灵显卡，尽量贴合原版、不引入额外功能。
+
+- 不做正式版本发布，灵活跟随 vLLM 上游可用版本。
+- 目前 AWQ INT4 与 W4A16 路径的 prefill 阶段有显著提升。
 
 ## 增强功能简要
 
@@ -17,7 +22,7 @@ vLLM-SM75 v0.1.4 基于 vLLM 0.29.0，集成 MTP、DFlash2 和自动休眠适配
 
 ## 快速复现
 
-v0.1.2 的基础推理验收、v0.1.3 新增自动休眠测试。
+以下覆盖基础推理验收与自动休眠测试。
 
 ### 编译缓存持久化
 
@@ -26,8 +31,8 @@ v0.1.2 的基础推理验收、v0.1.3 新增自动休眠测试。
 ### 1. 克隆
 
 ```bash
-git clone https://github.com/fishensw/VLLM-SM75.git
-cd VLLM-SM75
+git clone https://github.com/javier-house/vllm-Turing.git
+cd vllm-Turing
 ```
 
 ### 2. 构建
@@ -38,7 +43,7 @@ Linux x86_64，需安装 Docker、Git 和 Bash。启动模型另需 NVIDIA 驱�
 bash docker/build.sh
 ```
 
-基于固定 digest 的官方 `vllm/vllm-openai:v0.29.0-cu129` 镜像，安装全部适配并编译 SM75 扩展，生成 `vllm-sm75:v0.1.4`。
+基于固定 digest 的官方 `vllm/vllm-openai:v0.29.0-cu129` 镜像，安装全部适配并编译 SM75 扩展，生成 `vllm-Turing` 镜像。
 
 ### 3. 启动
 
@@ -78,7 +83,7 @@ curl --fail http://localhost:8000/v1/models \
   --header "Authorization: Bearer $VLLM_API_KEY"
 ```
 
-## Firefly
+## Firefly 内核
 
 INT4 路径用于大批量 prefill；本版本 FP8 线性计算仍使用 Marlin，FP8 测试启用的是 Firefly all-reduce。不能把未启用的 FP8 线性内核或其他模型数据作为当前27B的加速结果。
 
@@ -147,29 +152,6 @@ AUTO_SLEEP_IDLE_TIMEOUT=0 bash docker/run.sh
 | `--auto-sleep-page-cache-keep-interval` | reload 文件页预热间隔，默认 `600` 秒；脚本变量 `AUTO_SLEEP_PAGE_CACHE_KEEP_INTERVAL`。`0` 关闭睡眠时及后台预热，唤醒前仍提示预热一次 |
 
 exit 只在退出前提示预热主模型文件页，没有后台预热进程。预热是 OS 提示，不能保证唤醒必定命中内存中的文件页。客户端及反向代理超时应覆盖完整唤醒时间。
-
-### 已验证的推荐配置与效果（v0.1.3）
-
-**FP8 DFlash2 + 30 分钟 exit**：4 × Tesla T10 16 GiB、TP4、约 31 GiB 主机 RAM，CPU 使用 ondemand。主模型 `Qwen/Qwen3.8-27B-FP8`，草稿 `incoai/Qwen3.8-27B-DFlash2`。
-
-推理参数保持：**draft7、Graph `[8]`、seq4、batch8192、utilization 0.92、max-model-len 262144、每卡 KV 3288334336 bytes、FP8 e4m3 KV、8 GiB CPU KV offload**。这些显存预算针对该四卡环境。
-
-| 项目 | 本地实测结果 |
-| --- | --- |
-| 60 秒自动休眠 | API 在线，四卡连续三次采样均 P8；显存从 13663 降至 **3 MiB/卡** |
-| 待机功耗 | 驻留单次快照约 **38–43 W/卡**；休眠三次样本约 **10–15.3 W/卡** |
-| 自动唤醒 | 两个并发短请求均成功，完整请求耗时约 **135.7 秒** |
-| 缓存复用 | 已有缓存启动、exit 唤醒、改为 30 分钟后启动，均 **12 次 AOT 命中、零重新编译**；包含主模型、草稿和候选选择器 |
-| 缓存加载阶段 | 主模型 / 草稿 / 候选选择器约 **3.81 / 0.76 / 0.06 秒**，不等于完整唤醒耗时 |
-| 正式 30 分钟配置 | 已启动并通过健康检查和推理；本轮未额外等待完整 30 分钟休眠周期 |
-
-验收时先用 60 秒：完成一次推理后等待空闲超时及退出清理，确认 `/health` 在线，用下面命令观察 P-state、显存和功耗，再发请求确认能恢复，最后改回 30 分钟。
-
-```bash
-nvidia-smi --query-gpu=index,pstate,memory.used,power.draw --format=csv
-```
-
-P8 还取决于其他 GPU 进程、硬件和驱动，显存不要求绝对归零。当前 exit 验证环境为单 API server、DP=1、TP4；上述结果不代表其他模式、所有模型或 262K 长上下文都完成了本轮验收。CPU/reload 本轮只有状态机与参数测试，没有 GPU 唤醒性能保证。
 
 ## License
 
