@@ -8,6 +8,9 @@
 (P50/P90/P99)、prompt/generation token 分布、preemption 与 sleep 状态。
 HTML 独立成 dashboard.html, 可直接用浏览器打开看样式; 每次请求读盘, 改样式
 无需重启。VLLM_MONITOR 默认开, '0'/'off'/'false'/'no' 关(不挂路由)。
+
+同目录 test.html 是引入的开源 llm_speedtest 测速页(前端直连模型 API 测
+Prefill/Decode 吞吐), 由 VLLM_TEST_INDEX 控制 /test 路由, 同默认开/同关值。
 """
 
 import hashlib
@@ -24,7 +27,10 @@ from vllm import envs
 # 看板 HTML(独立文件, 便于直接打开/编辑), 与 monitor.py 同目录。
 _DASHBOARD_HTML_PATH = Path(__file__).resolve().parent / "dashboard.html"
 
-# 关值集合(移植到其他 vllm 时, 若其 envs 无 VLLM_MONITOR 字段, 回退直读该 env)。
+# 测速页 HTML(引入开源 llm_speedtest 静态页, 直连模型 API 测吞吐), 同目录。
+_TEST_HTML_PATH = Path(__file__).resolve().parent / "test.html"
+
+# 关值集合(移植到其他 vllm 时, 若其 envs 无对应字段, 回退直读该 env)。
 _OFF_VALUES = ("0", "off", "false", "no")
 
 
@@ -35,6 +41,16 @@ def _monitor_enabled() -> bool:
         return bool(envs.VLLM_MONITOR)
     except AttributeError:
         return os.environ.get("VLLM_MONITOR", "1").strip().lower() not in _OFF_VALUES
+
+
+def _test_index_enabled() -> bool:
+    """VLLM_TEST_INDEX 开关: 同 _monitor_enabled 的双路取法, 未设默认开。"""
+    try:
+        return bool(envs.VLLM_TEST_INDEX)
+    except AttributeError:
+        return (
+            os.environ.get("VLLM_TEST_INDEX", "1").strip().lower() not in _OFF_VALUES
+        )
 
 
 def _query_gpus() -> dict:
@@ -152,62 +168,74 @@ def _verify_api_key(request: Request) -> bool:
 
 
 def attach_router(app: FastAPI) -> None:
-    """按 VLLM_MONITOR 开关把 /monitor 挂到 app。
+    """按 VLLM_MONITOR / VLLM_TEST_INDEX 开关把 /monitor、/test 挂到 app。
 
-    关(0/off/false/no)时不挂任何路由。/monitor 不在 GUARDED_PREFIX 内,
-    浏览器无需 API key 即可访问; 页面内 fetch /metrics 亦同源无鉴权。
-    每次请求读盘 dashboard.html, 改样式直接刷新即可(无需重启)。
+    各自关(0/off/false/no)时不挂对应路由, 都关则不挂任何路由。/monitor
+    与 /test 均不在 GUARDED_PREFIX 内, 浏览器无需 API key 即可访问; 页面内
+    fetch /metrics 亦同源无鉴权。每次请求读盘 HTML, 改样式直接刷新即可
+    (无需重启)。
 
-    额外挂投机解码开关:
+    /monitor 额外挂投机解码开关:
     - GET  /monitor/spec_decode  只读, 无鉴权, 返回 {spec_configured, enabled}
     - POST /monitor/spec_decode  写, 需 x-api-key-hash(SHA-256), 切换开关
     开关只跳草稿计算, 不卸显存; 未配 --speculative-config 时 POST 返回 409。
     """
-    if not _monitor_enabled():
+    if not _monitor_enabled() and not _test_index_enabled():
         return
 
-    @app.get("/monitor", response_class=HTMLResponse, include_in_schema=False)
-    def monitor() -> HTMLResponse:  # noqa: N802
-        return HTMLResponse(_DASHBOARD_HTML_PATH.read_text(encoding="utf-8"))
+    if _monitor_enabled():
 
-    @app.get("/monitor/gpu", include_in_schema=False)
-    async def get_gpu() -> JSONResponse:  # noqa: N802
-        """只读, 无鉴权(与 /metrics 一致)。前端 GPU 监控部件轮询本端点。
+        @app.get("/monitor", response_class=HTMLResponse, include_in_schema=False)
+        def monitor() -> HTMLResponse:  # noqa: N802
+            return HTMLResponse(_DASHBOARD_HTML_PATH.read_text(encoding="utf-8"))
 
-        每次现调 nvidia-smi 采一次(无状态, 不缓存), 前端负责累加温度/功率
-        history 画曲线。失败时 ok=False, 前端降级不报错。
-        """
-        return JSONResponse(_query_gpus())
+        @app.get("/monitor/gpu", include_in_schema=False)
+        async def get_gpu() -> JSONResponse:  # noqa: N802
+            """只读, 无鉴权(与 /metrics 一致)。前端 GPU 监控部件轮询本端点。
 
-    @app.get("/monitor/spec_decode", include_in_schema=False)
-    async def get_spec_decode(request: Request) -> JSONResponse:  # noqa: N802
-        engine = request.app.state.engine_client
-        configured = await engine.is_speculative_decoding_configured()
-        enabled = (
-            await engine.is_speculative_decoding_enabled() if configured else False
-        )
-        return JSONResponse(
-            {
-                "spec_configured": configured,
-                "enabled": enabled,
-                # 无 --api-key 时为 False, 前端据此免弹 key 输入框。
-                "auth_required": bool(_configured_api_keys(request)),
-            }
-        )
+            每次现调 nvidia-smi 采一次(无状态, 不缓存), 前端负责累加温度/功率
+            history 画曲线。失败时 ok=False, 前端降级不报错。
+            """
+            return JSONResponse(_query_gpus())
 
-    @app.post("/monitor/spec_decode", include_in_schema=False)
-    async def set_spec_decode(request: Request) -> JSONResponse:  # noqa: N802
-        if not _verify_api_key(request):
-            return JSONResponse({"error": "Unauthorized"}, status_code=401)
-        try:
-            payload = await request.json()
-        except Exception:  # noqa: BLE001 - 空/坏 body 一律当 {enabled:true}
-            payload = {}
-        enabled = bool(payload.get("enabled", True))
-        engine = request.app.state.engine_client
-        if not await engine.is_speculative_decoding_configured():
-            return JSONResponse(
-                {"error": "speculative decoding not configured"}, status_code=409
+        @app.get("/monitor/spec_decode", include_in_schema=False)
+        async def get_spec_decode(request: Request) -> JSONResponse:  # noqa: N802
+            engine = request.app.state.engine_client
+            configured = await engine.is_speculative_decoding_configured()
+            enabled = (
+                await engine.is_speculative_decoding_enabled() if configured else False
             )
-        await engine.set_speculative_decoding(enabled)
-        return JSONResponse({"ok": True, "enabled": enabled})
+            return JSONResponse(
+                {
+                    "spec_configured": configured,
+                    "enabled": enabled,
+                    # 无 --api-key 时为 False, 前端据此免弹 key 输入框。
+                    "auth_required": bool(_configured_api_keys(request)),
+                }
+            )
+
+        @app.post("/monitor/spec_decode", include_in_schema=False)
+        async def set_spec_decode(request: Request) -> JSONResponse:  # noqa: N802
+            if not _verify_api_key(request):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            try:
+                payload = await request.json()
+            except Exception:  # noqa: BLE001 - 空/坏 body 一律当 {enabled:true}
+                payload = {}
+            enabled = bool(payload.get("enabled", True))
+            engine = request.app.state.engine_client
+            if not await engine.is_speculative_decoding_configured():
+                return JSONResponse(
+                    {"error": "speculative decoding not configured"},
+                    status_code=409,
+                )
+            await engine.set_speculative_decoding(enabled)
+            return JSONResponse({"ok": True, "enabled": enabled})
+
+    if _test_index_enabled():
+
+        @app.get("/test", response_class=HTMLResponse, include_in_schema=False)
+        def test_index() -> HTMLResponse:  # noqa: N802
+            """llm_speedtest 测速页: 前端直连模型 API 测 Prefill/Decode 吞吐,
+            同源无鉴权(与 /monitor 一致)。"""
+            return HTMLResponse(_TEST_HTML_PATH.read_text(encoding="utf-8"))

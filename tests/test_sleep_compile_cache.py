@@ -67,6 +67,7 @@ class SleepCompileCacheTests(unittest.TestCase):
             "VLLM_AUTO_SLEEP_PAGE_CACHE_KEEP_INTERVAL",
             "VLLM_USE_LAYERNAME",
             "VLLM_MONITOR",
+            "VLLM_TEST_INDEX",
         ]
         fake_envs.environment_variables = {
             n: fake_envs.environment_variables[n] for n in names
@@ -85,6 +86,18 @@ class SleepCompileCacheTests(unittest.TestCase):
         with patch.dict(os.environ, settings):
             factors = self.envs.compile_factors()
         return hashlib.sha256(json.dumps(factors, sort_keys=True).encode()).hexdigest()
+
+    def legacy_factors(self):
+        """按「升级前」历史签名构造因子, 供断言 wrapped 输出与之对齐:
+        pop 掉 INSTALL_IGNORED 的 auto-sleep 计时器; VLLM_MONITOR 沿用历史
+        签名(=False); VLLM_TEST_INDEX 是新增 env, 历史签名无此 key, 移除之。"""
+        legacy = self.envs.compile_factors.__wrapped__()
+        for name in _load_envs_sm75().INSTALL_IGNORED:
+            legacy.pop(name, None)
+        if "VLLM_MONITOR" in legacy:
+            legacy["VLLM_MONITOR"] = False
+        legacy.pop("VLLM_TEST_INDEX", None)
+        return legacy
 
     def test_sleep_policy_changes_preserve_cache_key(self):
         reference = self.cache_key(
@@ -113,12 +126,17 @@ class SleepCompileCacheTests(unittest.TestCase):
         reference = self.cache_key(VLLM_MONITOR="0")
         self.assertEqual(reference, self.cache_key(VLLM_MONITOR="1"))
         with patch.dict(os.environ, {"VLLM_MONITOR": "1"}):
-            legacy = self.envs.compile_factors.__wrapped__()
-            legacy["VLLM_MONITOR"] = False
-            for name in _load_envs_sm75().INSTALL_IGNORED:
-                legacy.pop(name, None)
-            self.assertEqual(legacy, self.envs.compile_factors())
+            self.assertEqual(self.legacy_factors(), self.envs.compile_factors())
             self.assertTrue(self.envs.environment_variables["VLLM_MONITOR"]())
+
+    def test_index_toggle_preserves_legacy_cache_without_disabling_ui(self):
+        # VLLM_TEST_INDEX 开/关同签名(新 env, 从 hash 因子 pop, 不残留 key)。
+        reference = self.cache_key(VLLM_TEST_INDEX="0")
+        self.assertEqual(reference, self.cache_key(VLLM_TEST_INDEX="1"))
+        with patch.dict(os.environ, {"VLLM_TEST_INDEX": "1"}):
+            # 与历史(升级前)签名对齐: 历史因子无该 key, wrapper pop 掉。
+            self.assertEqual(self.legacy_factors(), self.envs.compile_factors())
+            self.assertTrue(self.envs.environment_variables["VLLM_TEST_INDEX"]())
 
 
 if __name__ == "__main__":

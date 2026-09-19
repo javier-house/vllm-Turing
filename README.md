@@ -55,7 +55,7 @@ wheel 按镜像的 Python 3.12 下载，与构建机自身 Python 版本无关�
 
 ### 3. 启动
 
-用 `docker run` 启动：镜像名 `vllm-turing` 后接模型与启动参数。容器入口（entrypoint）启动时自动 `git pull` 最新 `vllm-Turing` 并按需重新 overlay（离线则沿用镜像内置 overlay），无需手动同步代码。先设置：
+用 `docker run` 启动：镜像名 `vllm-turing` 后接模型与启动参数。容器入口（entrypoint）默认**不更新**——直接用镜像内置代码，普通运行不受拉取影响；需要拉取最新 `vllm-Turing` 并重新 overlay 时加 `-e VLLM_TURING_UPDATE=1`（示例 A/B）。先设置：
 
 ```bash
 export VLLM_API_KEY='replace-with-your-api-key'
@@ -75,7 +75,7 @@ docker run -d --name vllm-turing-fp8 --gpus all --shm-size 16g \
   -v "$VLLM_SM75_CACHE_ROOT/shared/flashinfer":/root/.cache/flashinfer \
   -v "$VLLM_SM75_CACHE_ROOT/fp8/triton":/root/.triton/cache \
   -v "$VLLM_SM75_CACHE_ROOT/shared/torch_extensions":/root/.cache/torch_extensions \
-  -e VLLM_FIREFLY=1 -e VLLM_FIREFLY_AR=auto \
+  -e VLLM_FIREFLY=1 -e VLLM_FIREFLY_AR=auto -e VLLM_TURING_UPDATE=1 \
   -e TRITON_CACHE_DIR=/root/.triton/cache -e TORCH_EXTENSIONS_DIR=/root/.cache/torch_extensions \
   vllm-turing Qwen/Qwen3.8-27B-FP8 \
   --served-model-name VLLM-Qwen3.8-27B --host 0.0.0.0 --port 8000 --api-key "$VLLM_API_KEY" \
@@ -95,6 +95,33 @@ docker run -d --name vllm-turing-fp8 --gpus all --shm-size 16g \
 
 ```bash
 docker run -d --name vllm-turing-fp8 --gpus all --shm-size 16g \
+  -v "$VLLM_SM75_MODEL_CACHE_ROOT":/root/.cache/modelscope \
+  -v "$VLLM_SM75_MODEL_CACHE_ROOT":/root/.cache/huggingface \
+  -v "$VLLM_SM75_CACHE_ROOT/fp8/vllm":/root/.cache/vllm \
+  -v "$VLLM_SM75_CACHE_ROOT/shared/flashinfer":/root/.cache/flashinfer \
+  -v "$VLLM_SM75_CACHE_ROOT/fp8/triton":/root/.triton/cache \
+  -v "$VLLM_SM75_CACHE_ROOT/shared/torch_extensions":/root/.cache/torch_extensions \
+  -e VLLM_FIREFLY=1 -e VLLM_FIREFLY_AR=auto -e VLLM_TURING_UPDATE=1 \
+  -e TRITON_CACHE_DIR=/root/.triton/cache -e TORCH_EXTENSIONS_DIR=/root/.cache/torch_extensions \
+  vllm-turing Qwen/Qwen3.8-27B-FP8 \
+  --served-model-name VLLM-Qwen3.8-27B --host 0.0.0.0 --port 8000 --api-key "$VLLM_API_KEY" \
+  --tensor-parallel-size 4 --disable-custom-all-reduce \
+  --max-num-seqs 4 --max-num-batched-tokens 8192 \
+  --gpu-memory-utilization 0.87 --max-model-len auto \
+  --attention-config '{"backend":"FLASHINFER"}' --gdn-prefill-backend flashqla_sm75 \
+  --kv-cache-dtype fp8_e4m3 --block-size 32 --dtype float16 \
+  --hf-overrides '{"dtype":"float16"}' --generation-config vllm \
+  --enable-prefix-caching --async-scheduling \
+  --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE"}' \
+  --kv-transfer-config '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":8589934592}}' \
+  --auto-sleep-idle-timeout 30 --auto-sleep-offload-target exit
+```
+
+**示例 C：启动但不更新代码（默认行为，生产环境建议）**——与示例 A 相同（仍挂载本地项目），不设 `VLLM_TURING_UPDATE` 即默认不拉取、用镜像内置代码。生产环境建议使用此方式：代码版本固定、启动时不联网更新，行为可预期。
+
+```bash
+docker run -d --name vllm-turing-fp8 --gpus all --shm-size 16g \
+  -v /path/to/vllm-Turing:/vllm-Turing \
   -v "$VLLM_SM75_MODEL_CACHE_ROOT":/root/.cache/modelscope \
   -v "$VLLM_SM75_MODEL_CACHE_ROOT":/root/.cache/huggingface \
   -v "$VLLM_SM75_CACHE_ROOT/fp8/vllm":/root/.cache/vllm \
@@ -160,6 +187,12 @@ INT4 路径用于大批量 prefill；本版本 FP8 线性计算仍使用 Marlin�
 启动后访问 `http://主机IP:端口/monitor`。单文件HTML页面自动读取同源 `/metrics`，显示吞吐、并发、KV缓存、延迟分位、抢占与休眠状态，无CDN或额外监控服务依赖。
 
 默认开启；关闭时在 `docker run` 参数里加 `-e VLLM_MONITOR=0`，重新创建容器后生效。看板和 `/metrics` 当前无需模型API key即可访问。
+
+## `/test` 测速页
+
+启动后访问 `http://主机IP:端口/test`。页面引入开源工具 [llm_speedtest](https://github.com/gengchaogit/llm_speedtest) 的单文件HTML，前端直连模型 API（填本服务地址与 key）实测 Prefill/Decode 吞吐与首字延迟，无CDN或额外服务依赖。
+
+默认开启；关闭时在 `docker run` 参数里加 `-e VLLM_TEST_INDEX=0`，重新创建容器后生效。页面与 `/metrics` 当前无需模型API key即可访问。
 
 ## 空闲自动休眠
 

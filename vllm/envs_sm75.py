@@ -88,6 +88,21 @@ def _monitor() -> bool:
     )
 
 
+def _test_index() -> bool:
+    """VLLM_TEST_INDEX 归一化: 默认开; '0'/'off'/'false'/'no' 关。
+
+    开 = serve 在 /test 挂开源测速工具 llm_speedtest 的单文件 HTML 页(前端直连
+    模型 API 测 Prefill/Decode 吞吐, 无 CDN, 见
+    entrypoints/serve/instrumentator/test.html); 关 = 不挂该路由。
+    """
+    return os.getenv("VLLM_TEST_INDEX", "1").strip().lower() not in (
+        "0",
+        "off",
+        "false",
+        "no",
+    )
+
+
 # SM75 自定义 env → getter。install 时灌进 vllm.envs.environment_variables,
 # 之后 envs.<NAME> 属性访问 / is_set / validate_environ / __dir__ 自动生效。
 EXTENSIONS: dict[str, object] = {
@@ -130,6 +145,11 @@ EXTENSIONS: dict[str, object] = {
     # 轮询同源 /metrics); 0/off/false/no = 关(不挂路由)。见
     # entrypoints/serve/instrumentator/monitor.py。
     "VLLM_MONITOR": _monitor,
+    # 单文件 HTML 测速页开关, 默认开(_test_index 归一化)。
+    # 开 = serve 在 /test 挂 llm_speedtest 测速工具页(开源前端静态页, 直连模型
+    # API 测 Prefill/Decode 吞吐, 无 CDN); 0/off/false/no = 关(不挂路由)。见
+    # entrypoints/serve/instrumentator/test.html。
+    "VLLM_TEST_INDEX": _test_index,
     # A3(sm75 参考): custom allreduce 在 cuda graph capture 时的图输入策略。
     # auto=full decode 走 registered 快路径, piecewise/prefill 回退 staging
     # buffer(sm75 图私有大 buffer 无法经 CUDA IPC 导出); registered/staging
@@ -186,11 +206,14 @@ def apply() -> None:
             factors = _orig()
             for key in INSTALL_IGNORED:
                 factors.pop(key, None)
-            # 监控看板只挂 HTTP 路由, 不影响编译图; 沿用"monitor 关"的历史缓存
-            # 签名, 使开/关 UI 都能复用既有生产编译产物。不改 getter: 监控实际仍按
-            # VLLM_MONITOR 原值生效, 这里只归一化 hash 因子。
+            # 监控看板/测速页都只挂 HTTP 路由, 不影响编译图; 沿用"关"的历史缓存
+            # 签名, 使开/关 UI 都能复用既有生产编译产物。不改 getter: 开关实际仍
+            # 按 VLLM_MONITOR / VLLM_TEST_INDEX 原值生效, 这里只归一化 hash 因子:
+            # VLLM_MONITOR 沿用历史签名(=False); VLLM_TEST_INDEX 是新增 env, 历史
+            # 签名里没有该 key, pop 掉才能与之对齐。
             if "VLLM_MONITOR" in factors:
                 factors["VLLM_MONITOR"] = False
+            factors.pop("VLLM_TEST_INDEX", None)
             return factors
 
         _compile_factors_sm75._sm75_wrapped = True  # type: ignore[attr-defined]

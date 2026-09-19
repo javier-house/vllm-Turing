@@ -92,6 +92,7 @@ INJECTIONS: list[tuple[str, list[tuple[str, str, str]]]] = [
             "        ],\n",
             '            "/server_info",\n'
             '            "/monitor",\n'
+            '            "/test",\n'
             "        ],\n",
             '            "/monitor",\n',
         ), (
@@ -148,6 +149,7 @@ def main() -> None:
         "engine/arg_utils.py",
         "entrypoints/serve/instrumentator/monitor.py",
         "entrypoints/serve/instrumentator/dashboard.html",
+        "entrypoints/serve/instrumentator/test.html",
         "envs_sm75.py",
         "model_executor/kernels/linear/mixed_precision/marlin.py",
         "model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py",

@@ -26,6 +26,27 @@ IMAGE_REV_FILE=/opt/vllm-turing/image-source-revision
 
 log() { echo "[entrypoint] $*" >&2; }
 
+# 启动时是否拉取(git pull)最新代码: 默认不更新(生产安全); 显式 1/on/true/yes
+# 才开启。读完即 unset, 不传给 vllm 进程, 避免 vllm env 校验把它当未知 VLLM_*
+# 变量告警。
+_update="${VLLM_TURING_UPDATE:-0}"
+unset VLLM_TURING_UPDATE
+case "$_update" in
+  1 | on | true | yes)
+    _update=1
+    ;;
+  *)
+    _update=0
+    ;;
+esac
+
+# 默认不更新: 不 clone/pull, 直接用镜像构建时已应用的 overlay(离线可跑)。
+# 只有显式 VLLM_TURING_UPDATE=1 才走下面的"拉最新 + 按需重新 overlay"路径。
+if [[ "$_update" != 1 ]]; then
+  log "未开启 VLLM_TURING_UPDATE: 不拉取最新, 用镜像构建时已应用的 overlay。"
+  exec vllm serve "$@"
+fi
+
 # --- 1) 确定 overlay 源仓库 ---
 WORK=""
 if [[ -d "$IMAGE_DIR/.git" ]]; then
@@ -49,7 +70,8 @@ else
 fi
 
 # --- 2) 更新到最新分支(github -> gitee -> 跳过) ---
-# git 缺失时不阻断: 直接用当前仓库状态判断(离线镜像开箱可跑)。
+# 到此处 _update 必为 1(默认不更新已在前面返回); git 缺失时不阻断: 用当前仓库
+# 状态判断是否重新 overlay(离线镜像开箱可跑)。
 if ! command -v git >/dev/null 2>&1; then
   log "警告: 容器内无 git, 跳过拉取, 用镜像构建时已应用的 overlay。"
   exec vllm serve "$@"
