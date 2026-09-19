@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# vllm-sm75 overlay: idle auto-sleep controller for the V1 EngineCore.
+# vllm-turing overlay: idle auto-sleep controller for the V1 EngineCore.
 #
 # Upstream vLLM ships --enable-sleep-mode, but sleeping/waking must be driven
 # by external POST /sleep + POST /wake_up calls.  This controller adds the

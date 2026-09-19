@@ -750,7 +750,7 @@ class EngineArgs:
     enable_sleep_mode: bool = ModelConfig.enable_sleep_mode
     enable_cumem_allocator: bool = ModelConfig.enable_cumem_allocator
 
-    # vllm-sm75 overlay: auto-sleep control plane. Not part of VllmConfig;
+    # vllm-turing overlay: auto-sleep control plane. Not part of VllmConfig;
     # EngineArgs.__post_init__ propagates the values to the VLLM_AUTO_SLEEP_*
     # envs so the engine-core subprocess (vllm.v1.engine.auto_sleep) reads
     # them. See tmp/PLAN-auto-sleep-mode.md.
@@ -892,13 +892,13 @@ class EngineArgs:
                         self.tokenizer,
                     )
 
-        # vllm-sm75 overlay: validate --auto-sleep-* and propagate to envs
+        # vllm-turing overlay: validate --auto-sleep-* and propagate to envs
         # (after the offline model-path rewrite above, so the reload path
         # points at the resolved local directory when HF_HUB_OFFLINE).
         self._apply_auto_sleep_envs()
 
     def _apply_auto_sleep_envs(self) -> None:
-        # vllm-sm75 overlay: the engine-core subprocess inherits these envs;
+        # vllm-turing overlay: the engine-core subprocess inherits these envs;
         # they are consumed by vllm.v1.engine.auto_sleep there.
         if self.auto_sleep_idle_timeout < 0:
             raise ValueError(
@@ -1027,7 +1027,7 @@ class EngineArgs:
         model_group.add_argument(
             "--enable-cumem-allocator", **model_kwargs["enable_cumem_allocator"]
         )
-        # vllm-sm75 overlay: auto-sleep control plane (see EngineArgs fields).
+        # vllm-turing overlay: auto-sleep control plane (see EngineArgs fields).
         model_group.add_argument(
             "--auto-sleep-idle-timeout",
             type=float,

@@ -137,7 +137,7 @@ EXTENSIONS: dict[str, object] = {
     "VLLM_CUSTOM_ALLREDUCE_GRAPH_INPUT_MODE": lambda: os.getenv(
         "VLLM_CUSTOM_ALLREDUCE_GRAPH_INPUT_MODE", "auto"
     ),
-    # vllm-sm75 overlay: idle auto-sleep. Populated by EngineArgs from the
+    # vllm-turing overlay: idle auto-sleep. Populated by EngineArgs from the
     # --auto-sleep-* CLI flags; consumed inside the engine-core process by
     # vllm.v1.engine.auto_sleep(那里用 os.environ.get 直读, 此处注册仅为让
     # validate_environ 不告警 + 被 compile_factors 看到后由 INSTALL_IGNORED 排除)。

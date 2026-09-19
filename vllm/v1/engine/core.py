@@ -72,7 +72,7 @@ from vllm.v1.engine import (
     UtilityOutput,
     UtilityResult,
 )
-# vllm-sm75 overlay: idle auto-sleep controller (no-op unless configured)
+# vllm-turing overlay: idle auto-sleep controller (no-op unless configured)
 from vllm.v1.engine.auto_sleep import AutoSleepController
 from vllm.v1.engine.tensor_ipc import TensorIpcReceiver
 from vllm.v1.engine.utils import (
@@ -243,7 +243,7 @@ class EngineCore:
 
         self._idle_state_callbacks: list[Callable] = []
 
-        # vllm-sm75 overlay: idle auto-sleep (no-op unless the
+        # vllm-turing overlay: idle auto-sleep (no-op unless the
         # --auto-sleep-* / VLLM_AUTO_SLEEP_* configuration is present).
         self.auto_sleep = AutoSleepController(self, EngineCoreRequestType.WAKEUP)
         if self.auto_sleep.enabled:
@@ -480,7 +480,7 @@ class EngineCore:
                 f"request_id must be a string, got {type(request.request_id)}"
             )
 
-        # vllm-sm75 overlay: refresh auto-sleep idle clock / wake engine.
+        # vllm-turing overlay: refresh auto-sleep idle clock / wake engine.
         self.auto_sleep.on_request_arrival()
 
         if pooling_params := request.pooling_params:
@@ -906,7 +906,7 @@ class EngineCore:
         """Return whether the scheduler is in any pause state."""
         return self.scheduler.pause_state != PauseState.UNPAUSED
 
-    # vllm-sm75 overlay: runtime speculative-decoding on/off. Reached from the
+    # vllm-turing overlay: runtime speculative-decoding on/off. Reached from the
     # frontend via the generic UTILITY channel (no dedicated core_client method).
     # Toggling only changes whether drafting runs on subsequent steps; the draft
     # model, CUDA graphs and draft KV cache stay resident.
@@ -1074,7 +1074,7 @@ class EngineCoreProc(EngineCore):
     """ZMQ-wrapper for running EngineCore in background process."""
 
     ENGINE_CORE_DEAD = b"ENGINE_CORE_DEAD"
-    # vllm-sm75 overlay: deep-sleep exit sentinel. Sent on the output socket
+    # vllm-turing overlay: deep-sleep exit sentinel. Sent on the output socket
     # immediately before an intentional auto-sleep process exit, so the client
     # can tell it apart from a crash and respawn the engine on the next
     # request instead of treating it as fatal.
@@ -1599,7 +1599,7 @@ class EngineCoreProc(EngineCore):
         """Dispatch request from client."""
 
         if request_type == EngineCoreRequestType.WAKEUP:
-            # vllm-sm75 overlay: auto-sleep timer poke (no-op unless armed).
+            # vllm-turing overlay: auto-sleep timer poke (no-op unless armed).
             self.auto_sleep.on_wakeup_poke()
             return
         elif request_type == EngineCoreRequestType.ADD:
@@ -1707,7 +1707,7 @@ class EngineCoreProc(EngineCore):
                 "to send. Please report this issue."
             )
 
-    # vllm-sm75 overlay: deep-sleep exit (auto-sleep offload-target "exit").
+    # vllm-turing overlay: deep-sleep exit (auto-sleep offload-target "exit").
     def _send_deep_sleep_exiting(self):
         """Notify the client that this process is exiting intentionally for
         deep sleep, so it respawns the engine on the next request instead of
@@ -1958,7 +1958,7 @@ class EngineCoreProc(EngineCore):
 
             while True:
                 output = self.output_queue.get()
-                # vllm-sm75 overlay: DEEP_SLEEP_EXITING rides the same
+                # vllm-turing overlay: DEEP_SLEEP_EXITING rides the same
                 # send-and-stop channel as ENGINE_CORE_DEAD.
                 if output in (
                     EngineCoreProc.ENGINE_CORE_DEAD,

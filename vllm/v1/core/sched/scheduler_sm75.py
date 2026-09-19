@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 #
-# vllm-sm75 overlay: 运行中动态开/关投机解码的 scheduler 子类。
+# vllm-turing overlay: 运行中动态开/关投机解码的 scheduler 子类。
 # 通过 --scheduler-cls vllm.v1.core.sched.scheduler_sm75.SM75Scheduler 启用。
 #
 # 设计:把父类的 num_spec_tokens 实例属性改成 property。关闭时 getter 返回 0,

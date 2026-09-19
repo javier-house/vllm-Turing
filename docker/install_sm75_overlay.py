@@ -188,7 +188,7 @@ def main() -> None:
     # 上游 envs.py 升级随便改, 只需保证仍含 environment_variables dict +
     # compile_factors 返回 dict; 本行与上面 backend registration 手法一致。
     envs_file = package_root / "envs.py"
-    envs_hook = "\n# vllm-sm75 overlay: inject SM75 extension envs (idempotent).\nimport vllm.envs_sm75\nvllm.envs_sm75.apply()\n"
+    envs_hook = "\n# vllm-turing overlay: inject SM75 extension envs (idempotent).\nimport vllm.envs_sm75\nvllm.envs_sm75.apply()\n"
     envs_text = envs_file.read_text()
     if "vllm.envs_sm75.apply()" not in envs_text:
         envs_file.write_text(envs_text + envs_hook)

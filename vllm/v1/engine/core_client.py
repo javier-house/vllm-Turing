@@ -428,7 +428,7 @@ class BackgroundResources:
     # processing threads can access it without holding a ref to the client.
     engine_dead: bool = False
 
-    # vllm-sm75 overlay: set when the engine exited intentionally for deep
+    # vllm-turing overlay: set when the engine exited intentionally for deep
     # sleep (auto-sleep offload-target "exit").  Distinct from engine_dead:
     # the client stays alive and transparently respawns the engine on the
     # next request.
@@ -549,14 +549,14 @@ class MPClient(EngineCoreClient):
             # State used for data parallel.
             self.engines_running = False
             parallel_config = vllm_config.parallel_config
-            # vllm-sm75 overlay: deep-sleep exit (auto-sleep offload-target
+            # vllm-turing overlay: deep-sleep exit (auto-sleep offload-target
             # "exit") terminates and later respawns the engine in place, so
             # the input ROUTER needs handover to let the respawned engine
             # take over the same connection identity.
             self._deep_sleep_exit_enabled = (
                 os.environ.get("VLLM_AUTO_SLEEP_OFFLOAD_TARGET") == "exit"
             )
-            # vllm-sm75 overlay: launch parameters captured for deep-sleep
+            # vllm-turing overlay: launch parameters captured for deep-sleep
             # respawn (populated only when _deep_sleep_exit_enabled).
             self._respawn_executor_class: type[Executor] | None = None
             self._respawn_log_stats: bool = False
@@ -641,7 +641,7 @@ class MPClient(EngineCoreClient):
                     addresses = engine_launch.addresses
                     tensor_queue = engine_launch.tensor_queue
 
-                # vllm-sm75 overlay: save the launch parameters so a deep-sleep
+                # vllm-turing overlay: save the launch parameters so a deep-sleep
                 # exit can respawn the engine in place on the next request.
                 if self._deep_sleep_exit_enabled:
                     self._respawn_executor_class = executor_class
@@ -757,7 +757,7 @@ class MPClient(EngineCoreClient):
             _self = self_ref()
             if not _self or not _self._finalizer.alive or _self.resources.engine_dead:
                 return
-            # vllm-sm75 overlay: an intentional deep-sleep exit is signalled on
+            # vllm-turing overlay: an intentional deep-sleep exit is signalled on
             # the output socket right before the process exits.  The engine
             # flushes that sentinel (joining its output thread) before exiting,
             # but allow a brief grace in case it is still being processed so we
@@ -795,7 +795,7 @@ class MPClient(EngineCoreClient):
         return config
 
     def _respawn_launch(self) -> None:
-        # vllm-sm75 overlay: deep-sleep respawn (spawn + handshake only).
+        # vllm-turing overlay: deep-sleep respawn (spawn + handshake only).
         #
         # Re-runs the launch machinery so the new EngineCore process
         # re-handshakes and reconnects to this client's still-bound
@@ -1131,7 +1131,7 @@ class AsyncMPClient(MPClient):
             try:
                 while True:
                     frames = await output_socket.recv_multipart(copy=False)
-                    # vllm-sm75 overlay: deep-sleep exit sentinel.  The engine
+                    # vllm-turing overlay: deep-sleep exit sentinel.  The engine
                     # is terminating intentionally (auto-sleep "exit"); mark
                     # it and keep waiting so the respawned engine's outputs
                     # are picked up, rather than surfacing an EngineDeadError.
@@ -1251,7 +1251,7 @@ class AsyncMPClient(MPClient):
         self._ensure_output_queue_task()
 
     async def respawn_engine(self) -> None:
-        # vllm-sm75 overlay: respawn the EngineCore after a deep-sleep exit.
+        # vllm-turing overlay: respawn the EngineCore after a deep-sleep exit.
         #
         # The blocking launch (process spawn + handshake, incl. the full model
         # load) runs in a worker thread; the READY wait uses the asyncio input

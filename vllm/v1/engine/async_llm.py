@@ -64,7 +64,7 @@ from vllm.v1.metrics.stats import IterationStats
 logger = init_logger(__name__)
 
 # ---------------------------------------------------------------------------
-# vllm-sm75 overlay: deep-sleep respawn tuning.
+# vllm-turing overlay: deep-sleep respawn tuning.
 #
 # Respawning an engine is a full cold start (model load + CUDA graph capture),
 # and GPU memory is released asynchronously when the previous engine exits.
@@ -157,7 +157,7 @@ class AsyncLLM(EngineClient):
 
         self.vllm_config = vllm_config
         self._elastic_ep_lock = asyncio.Lock()
-        # vllm-sm75 overlay: serializes deep-sleep respawns so concurrent
+        # vllm-turing overlay: serializes deep-sleep respawns so concurrent
         # requests arriving while the engine is down trigger exactly one
         # respawn and all wait for it.
         self._deep_sleep_respawn_lock = asyncio.Lock()
@@ -426,7 +426,7 @@ class AsyncLLM(EngineClient):
         if self.errored:
             raise EngineDeadError()
 
-        # vllm-sm75 overlay: deep-sleep gate.  If the engine exited for deep
+        # vllm-turing overlay: deep-sleep gate.  If the engine exited for deep
         # sleep (auto-sleep "exit"), respawn it transparently before
         # submitting; this request's latency includes the cold start.  The
         # pending flag also re-enters the gate after a failed attempt so the
@@ -983,7 +983,7 @@ class AsyncLLM(EngineClient):
         """Return whether the engine is currently paused."""
         return await self.engine_core.is_scheduler_paused_async()
 
-    # vllm-sm75 overlay: runtime speculative-decoding on/off. Uses the generic
+    # vllm-turing overlay: runtime speculative-decoding on/off. Uses the generic
     # UTILITY channel (no dedicated core_client method needed); the engine-core
     # methods are looked up by name on the other side.
     async def set_speculative_decoding(self, enabled: bool) -> None:
@@ -1281,7 +1281,7 @@ class AsyncLLM(EngineClient):
         return EngineDeadError()
 
     async def _await_deep_sleep_respawn(self) -> None:
-        # vllm-sm75 overlay: concurrency-safe deep-sleep respawn gate.
+        # vllm-turing overlay: concurrency-safe deep-sleep respawn gate.
         #
         # Requests arriving while the engine is asleep share ONE respawn: the
         # first one ("leader") performs it, the rest join the in-flight task
@@ -1494,7 +1494,7 @@ class AsyncLLM(EngineClient):
         which is what unblocks the monitor; the two operate on the same process
         lifecycle (the manager serializes terminate/join), so this is safe.
 
-        vllm-sm75 overlay: engine_manager.shutdown() only knows the *current*
+        vllm-turing overlay: engine_manager.shutdown() only knows the *current*
         round's manager (it is overwritten each launch_core_engines) and cannot
         reach a worker wedged in an NCCL P2P deadlock (SIGTERM-unresponsive),
         so it is followed by a process-name sweep of any residual VLLM workers

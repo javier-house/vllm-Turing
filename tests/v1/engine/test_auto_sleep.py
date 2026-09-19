@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# vllm-sm75 overlay tests: auto-sleep config + controller state machine.
+# vllm-turing overlay tests: auto-sleep config + controller state machine.
 #
 # Runs two ways:
 #   * in the SM75 image under pytest (vllm importable, overlay installed);

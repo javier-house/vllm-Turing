@@ -28,5 +28,5 @@ def install(source, package, evidence):
 
 if __name__ == '__main__':
     import vllm
-    install(Path('/opt/vllm-sm75/speculative'), Path(vllm.__file__).resolve().parent,
-            Path('/opt/vllm-sm75/evidence/speculative-files.json'))
+    install(Path('/opt/vllm-turing/speculative'), Path(vllm.__file__).resolve().parent,
+            Path('/opt/vllm-turing/evidence/speculative-files.json'))
