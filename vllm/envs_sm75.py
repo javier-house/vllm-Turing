@@ -74,6 +74,23 @@ def _firefly_ar_backend() -> str:
     return "auto"
 
 
+def _firefly_ar_pipe() -> bool:
+    """VLLM_FIREFLY_AR_PIPE 归一化: 默认关; '1'/'on'/'true'/'yes' 开。
+
+    开 = 2-GPU SHM 大消息按 4MB 分块跨 2 stream 全双工 overlap (D2H 发 与 H2D
+    收 并发), 全双工 PCIe 链 (二号机 GPU0<->host) 通信项 ~2x, 数值与串行
+    firefly_ar_exchange 逐 bit 一致; 半双工链 (T10/一号机) 上分块串行化 ≈ 无
+    回退。仅 2-GPU SHM 生效, 小消息 (<=4MB) 仍走串行。默认关保证不改变现有
+    行为 (T10 零影响)。见 firefly_allreduce.py / firefly_ar_exchange_pipe。
+    """
+    return os.getenv("VLLM_FIREFLY_AR_PIPE", "").strip().lower() in (
+        "1",
+        "on",
+        "true",
+        "yes",
+    )
+
+
 def _monitor() -> bool:
     """VLLM_MONITOR 归一化: 默认开; '0'/'off'/'false'/'no' 关。
 
@@ -140,6 +157,10 @@ EXTENSIONS: dict[str, object] = {
     # p2p(强制) / shm(强制)。P2P 有 NVLink/PCIe 直连时 data/flag 全 device 显存
     # 无 host bounce; 无 P2P (PHB 如 T10) 回 SHM。见 firefly_allreduce.py。
     "VLLM_FIREFLY_AR_BACKEND": _firefly_ar_backend,
+    # SHM 分块全双工流水线开关, 默认关(_firefly_ar_pipe 归一化)。
+    # 开 = 2-GPU SHM 大消息按 4MB 分块跨 2 stream overlap (全双工链通信项 ~2x,
+    # 数值与串行一致); 半双工链 (T10/一号机) ≈ 无回退。仅 2-GPU SHM 生效。
+    "VLLM_FIREFLY_AR_PIPE": _firefly_ar_pipe,
     # 单文件 HTML 监控页开关, 默认开(_monitor 归一化)。
     # 开 = serve 在 /monitor 挂自包含 HTML 看板(纯前端 canvas 图表, 无 CDN,
     # 轮询同源 /metrics); 0/off/false/no = 关(不挂路由)。见
