@@ -107,6 +107,43 @@ INJECTIONS: list[tuple[str, list[tuple[str, str, str]]]] = [
             "    attach_monitor_router(app)\n",
         )],
     ),
+    (
+        # MTP draft model 漏声明 SupportsPP: PP>1 时 draft config 校验
+        # verify_with_parallel_config -> is_pp_supported_model 抛
+        # NotImplementedError("Pipeline parallelism is not supported for this model")。
+        # 代码本身已为 PP 适配(forward 收 intermediate_tensors / __init__ 用
+        # is_last_rank 处理 lm_head), 只缺声明, 对齐已支持 PP 的 Qwen4ExpMTP。
+        # 三处: 1) import 引入 SupportsPP; 2) 类声明加 SupportsPP(Qwen3_5MoeMTP
+        # 经 MRO 一并继承); 3) __init__ 暴露 make_empty_intermediate_tensors
+        # (PP rank>0 profiling 需要, 且是 supports_pp 检出的 PP 必需属性)。
+        "model_executor/models/qwen3_5_mtp.py",
+        [(
+            "    MultiModalEmbeddings,\n"
+            "    SupportsMultiModal,\n"
+            "    _require_is_multimodal,\n"
+            ")",
+            "    MultiModalEmbeddings,\n"
+            "    SupportsMultiModal,\n"
+            "    SupportsPP,\n"
+            "    _require_is_multimodal,\n"
+            ")",
+            "    SupportsMultiModal,\n"
+            "    SupportsPP,\n",
+        ), (
+            "class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal):",
+            "class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):",
+            "nn.Module, SupportsMultiModal, SupportsPP",
+        ), (
+            "        self.logits_processor = LogitsProcessor(config.vocab_size)",
+            "        self.logits_processor = LogitsProcessor(config.vocab_size)\n"
+            "        # PP: 暴露 make_empty_intermediate_tensors(PP rank>0 profiling\n"
+            "        # 需要, 且是 supports_pp 检出的 PP 必需属性); 对齐 Qwen4ExpMTP。\n"
+            "        self.make_empty_intermediate_tensors = (\n"
+            "            self.model.make_empty_intermediate_tensors\n"
+            "        )",
+            "self.model.make_empty_intermediate_tensors",
+        )],
+    ),
 ]
 
 
