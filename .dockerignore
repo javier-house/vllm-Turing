@@ -1,4 +1,5 @@
-/.git
+# 不再排除 /.git: 镜像需自带完整仓库, 未挂载时 entrypoint 以镜像内 /vllm-Turing 为
+# overlay 源判断; git 在 runtime 阶段 apt 安装(Dockerfile)。
 /tmp/
 /local-tests
 /.env

@@ -30,7 +30,15 @@ RUN python3 /opt/flashqla-build/source/build_extension.py \
 
 # 2) runtime: 整个项目(含 docker/tmp 预下载 wheel) + 依赖(离线优先) + 工具 + 预编译 .so + 构建期 overlay + 校验
 FROM ${BASE_IMAGE} AS runtime
+# git: entrypoint 挂载模式/离线 fallback 判 overlay 源状态需要它(base 镜像原本没有,
+# 缺失时 entrypoint 直接跳过重新 overlay, 分支修复无法在运行时生效)。
+RUN set -eux; \
+    apt-get update; \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git; \
+    rm -rf /var/lib/apt/lists/*
 # 整个项目先拷进来(含 docker/tmp/wheels 预下载 wheel; 该目录不存在也不影响 COPY .)。
+# 注意 .dockerignore 不再排除 /.git: 镜像自带完整仓库, 未挂载时 entrypoint 可直接
+# 以镜像内 /vllm-Turing 为 overlay 源判断(见 entrypoint.sh)。
 COPY . /vllm-Turing
 # flashinfer 0.6.18 + transformers 5.15.1: docker/tmp/wheels 里有对应 wheel 就离线安装,
 # 缺则在线下载。去 flashinfer-jit-cache: 无 SM75 AOT cubin, 会挂 CUDA graph warmup。
