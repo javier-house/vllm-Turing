@@ -157,6 +157,22 @@ INJECTIONS: list[tuple[str, list[tuple[str, str, str]]]] = [
             "        # SM75 PP+MTP: drafter 整体驻留单个 PP rank, 恒走 embedding 路径\n",
         )],
     ),
+    (
+        # PP+MTP 第三层: sample_tokens 里 drafter MM embedding 守卫。
+        # encoder_cache 只在 is_first_pp_rank 建 (model_runner 251-252), drafter 在
+        # last pp rank 故 encoder_cache=None; 但守卫只看 speculator.supports_mm_inputs
+        # (按 model_config 全局算, 恒 True) -> gather_mm_embeddings 需不存在的
+        # encoder_runner -> AttributeError 崩 (sample_tokens 阶段)。TP4 (PP=1) first==last,
+        # encoder_cache 正常, 不撞。加 encoder_cache is not None: 无 encoder 的 rank
+        # 本就没有 MM embedding 可 gather, draft 走纯文本即可 (mm_inputs 默认 None)。
+        "v1/worker/gpu/model_runner.py",
+        [(
+            "        if self.speculator is not None and self.speculator.supports_mm_inputs:\n",
+            "        if (self.speculator is not None and self.speculator.supports_mm_inputs\n"
+            "                and self.encoder_cache is not None):\n",
+            "                and self.encoder_cache is not None):\n",
+        )],
+    ),
 ]
 
 
