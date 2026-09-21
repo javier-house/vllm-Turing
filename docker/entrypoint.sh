@@ -26,6 +26,16 @@ IMAGE_REV_FILE=/opt/vllm-turing/image-source-revision
 
 log() { echo "[entrypoint] $*" >&2; }
 
+# git safe.directory: 挂载模式下 /vllm-Turing 属主是宿主机用户(如 niguoguan),
+# 容器内以 root 跑 git 会触发 "dubious ownership" fatal —— rev-parse/pull 全挂,
+# 表现为"仓库 HEAD(未知)"、自动 pull 从不生效、每次都误判需重新 overlay。
+# 容器内 root 的 ~/.gitconfig 每次启动全新, 这里无条件加白名单(离线也无害)。
+if command -v git >/dev/null 2>&1; then
+  for _d in "$IMAGE_DIR" "$CLONE_DIR"; do
+    git config --global --add safe.directory "$_d" 2>/dev/null || true
+  done
+fi
+
 # 启动时是否拉取(git pull)最新代码: 默认不更新(生产安全); 显式 1/on/true/yes
 # 才开启。读完即 unset, 不传给 vllm 进程, 避免 vllm env 校验把它当未知 VLLM_*
 # 变量告警。

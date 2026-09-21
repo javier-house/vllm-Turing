@@ -18,6 +18,28 @@ from pathlib import Path
 # 保留注释行), 第二次跑 anchor 仍在会重复注入。probe 必须只在注入后存在。
 INJECTIONS: list[tuple[str, list[tuple[str, str, str]]]] = [
     (
+        # PP+投机 第四层(warmup 死锁, 600s NCCL watchdog 超时): PP 下 drafter 只驻留
+        # 末 rank, warmup 的 spec decode step 在 PP0/PP1 不完全对称, 观察到两 rank 对
+        # pp_broadcast(采样结果广播)的参与判定错位 -> PP0 收端已 enqueue 等待, PP1
+        # 发端已 return 进入下一步的 irecv -> 集合通信死锁, 崩溃循环。warmup 仅预热
+        # kernel 非功能必需; PP 下强制走 non-spec 形状绕开该路径, drafter kernel 推迟
+        # 到首次真实 decode 才 JIT(秒级), 不影响正确性。函数内 import get_pp_group
+        # (vllm.distributed 顶层导出), 不依赖上游 import 块。
+        "v1/worker/gpu/warmup.py",
+        [(
+            "    num_spec_steps = model_runner.num_speculative_steps\n",
+            "    from vllm.distributed import get_pp_group\n"
+            "    # SM75 PP+spec: warmup 的 spec 路径在 PP 两 rank 不对称,\n"
+            "    # pp_broadcast 参与判定错位 -> 600s NCCL watchdog 死锁。\n"
+            "    # warmup 仅预热 kernel, PP 下走 non-spec 形状绕开。\n"
+            "    if get_pp_group().world_size > 1:\n"
+            "        num_spec_steps = 0\n"
+            "    else:\n"
+            "        num_spec_steps = model_runner.num_speculative_steps\n",
+            "    if get_pp_group().world_size > 1:\n",
+        )],
+    ),
+    (
         "model_executor/layers/quantization/utils/marlin_utils_fp8.py",
         [(
             # 上游同一条 warning 文本出现 2 次(prepare_fp8_layer_for_marlin 与另一函数),
