@@ -76,6 +76,21 @@ if ! command -v git >/dev/null 2>&1; then
   log "警告: 容器内无 git, 跳过拉取, 用镜像构建时已应用的 overlay。"
   exec vllm serve "$@"
 fi
+
+# 仓库 overlay 脚本自动同步: 运行时链(entrypoint 调 fast_compile -> overlay 脚本)
+# 若沿用镜像内烘焙副本, 仓库改了这些脚本就必须逐个 --volume 挂载覆盖。这里在确定
+# overlay 源($WORK)后, 把仓库 docker/ 下同名 helper 脚本同步到 /opt/vllm-turing,
+# 使后续 fast_compile 一律用仓库最新版; 镜像烘焙副本退为离线/不挂载时的兜底。
+# 不复制 entrypoint.sh 自身(正在执行中), 其逻辑变化靠重建镜像生效(极少改)。
+if [[ -d "$WORK/docker" ]]; then
+  for _f in fast_compile.sh install_sm75_overlay.py install_speculative.py \
+            patch_transformers_startup.py verify_sm75_image.py; do
+    if [[ -f "$WORK/docker/$_f" ]]; then
+      cp -f "$WORK/docker/$_f" "/opt/vllm-turing/$_f"
+    fi
+  done
+  log "已把仓库 docker/ 脚本同步到 /opt/vllm-turing(免 --volume 逐文件挂载)。"
+fi
 updated=0
 if git -C "$WORK" pull --ff-only 2>/dev/null; then
   updated=1
