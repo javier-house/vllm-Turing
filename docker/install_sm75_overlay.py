@@ -142,6 +142,19 @@ INJECTIONS: list[tuple[str, list[tuple[str, str, str]]]] = [
             "            self.model.make_empty_intermediate_tensors\n"
             "        )",
             "self.model.make_empty_intermediate_tensors",
+        ), (
+            # PP+MTP 运行时: drafter 整体放在最后一个 PP rank
+            # (gpu_model_runner "put the entire draft model on the last PP rank"),
+            # MTP 层并不按 PP 切分(range(num_mtp_layers) 全量)。但 forward 用全局
+            # get_pp_group().is_first_rank 判分支, 在 PP>1 时 last rank 走
+            # intermediate_tensors 分支, 而 drafter 的 dummy_run/propose 从不传该参
+            # -> assert 崩 (KV profiling 阶段 Worker died)。MTP 恒整体驻留单个
+            # rank, 恒走 embedding 路径即可; 尾部 is_last_rank 分支在该 rank 为
+            # True, 正常返回 hidden_states。
+            "        if get_pp_group().is_first_rank:\n",
+            "        # SM75 PP+MTP: drafter 整体驻留单个 PP rank, 恒走 embedding 路径\n"
+            "        if True:\n",
+            "        # SM75 PP+MTP: drafter 整体驻留单个 PP rank, 恒走 embedding 路径\n",
         )],
     ),
 ]
