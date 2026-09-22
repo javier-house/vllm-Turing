@@ -120,6 +120,74 @@ def _test_index() -> bool:
     )
 
 
+def _ple_mmap() -> bool:
+    """VLLM_PLE_MMAP 归一化: 默认关; '1'/'on'/'true'/'yes' 开。
+
+    开 = qwen4_exp 的 PLE(ngram) 大表 (如 Qwen3.8-Flash-Next 的 105GB 表) 不进
+    显存, 走 NVMe mmap 行 gather 经内核 page cache 换页 (见 vllm/vllm_ple_mmap.py)。
+    gather 是 CPU 活 + pageable H2D, 改走图外 custom op —— 会改变编译图行为,
+    故**不**加进 INSTALL_IGNORED、也不在 _compile_factors_sm75 pop: 开了就应是
+    新编译产物。
+    """
+    return os.getenv("VLLM_PLE_MMAP", "").strip().lower() in (
+        "1",
+        "on",
+        "true",
+        "yes",
+    )
+
+
+def _ple_mmap_random() -> bool:
+    """VLLM_PLE_MMAP_RANDOM 归一化: 默认开; '0'/'off' 关。
+
+    开 = PLE mmap 标 MADV_RANDOM 关内核预读 (稀疏随机行 gather 用不上顺序预读,
+    省 NVMe 带宽 + page cache)。见 vllm/vllm_ple_mmap.py::_apply_madv_random。
+    """
+    return os.getenv("VLLM_PLE_MMAP_RANDOM", "1").strip().lower() not in (
+        "0",
+        "off",
+        "false",
+        "no",
+    )
+
+
+def _ple_mmap_prewarm() -> bool:
+    """VLLM_PLE_MMAP_PREWARM 归一化: 默认关; '1'/'on' 开。
+
+    开 = 加载时把整表流读一遍填 page cache (无害可驱逐, 取决于空闲内存)。
+    见 vllm/vllm_ple_mmap.py::MmapPleTable.prewarm。
+    """
+    return os.getenv("VLLM_PLE_MMAP_PREWARM", "").strip().lower() in (
+        "1",
+        "on",
+        "true",
+        "yes",
+    )
+
+
+def _ple_mmap_mode() -> str:
+    """VLLM_PLE_MMAP_MODE 归一化: PLE(ngram) 表 offload 模式, 三选一可独立设置。
+
+    - disk (默认 / 或仅 VLLM_PLE_MMAP=1): 磁盘 mmap + page cache 换页, 不进显存/
+      常驻 RAM。
+    - mem: 整表读进 RAM (numpy 连续数组), gather 纯内存无换页 (需 ~95G 主机内存)。
+    - vram: 不 offload, 整表进显存 (占 ~95G, 仅小表/验证用)。
+
+    优先级: 显式 MODE > VLLM_PLE_MMAP(1→disk) > 默认 disk。见
+    vllm/vllm_ple_mmap.py::mode。纯运行时选择, 不改编译图 → 不进 _compile_factors。
+    """
+    m = os.getenv("VLLM_PLE_MMAP_MODE", "").strip().lower()
+    if m:
+        if m in ("mem", "memory", "ram", "cpu"):
+            return "mem"
+        if m in ("vram", "gpu", "none", "0", "off"):
+            return "vram"
+        return "disk"
+    if os.getenv("VLLM_PLE_MMAP", "").strip().lower() in ("1", "on", "true", "yes"):
+        return "disk"
+    return "vram"
+
+
 # SM75 自定义 env → getter。install 时灌进 vllm.envs.environment_variables,
 # 之后 envs.<NAME> 属性访问 / is_set / validate_environ / __dir__ 自动生效。
 EXTENSIONS: dict[str, object] = {
@@ -171,6 +239,27 @@ EXTENSIONS: dict[str, object] = {
     # API 测 Prefill/Decode 吞吐, 无 CDN); 0/off/false/no = 关(不挂路由)。见
     # entrypoints/serve/instrumentator/test.html。
     "VLLM_TEST_INDEX": _test_index,
+    # PLE(ngram) 大表 NVMe mmap 总开关, 默认关(_ple_mmap 归一化)。
+    # 开 = qwen4_exp PLE 表 (如 105GB 的 Qwen3.8-Flash-Next) 不进显存, 走内核
+    # page cache 换页行 gather。改变编译图 (gather 走图外 op) → 正常参与编译
+    # hash, 不加 INSTALL_IGNORED、不 pop。见 vllm/vllm_ple_mmap.py。
+    "VLLM_PLE_MMAP": _ple_mmap,
+    # PLE(ngram) 表 offload 模式: disk/mem/vram 三选一 (_ple_mmap_mode 归一化)。
+    # disk=磁盘 mmap 换页(默认), mem=整表进 RAM, vram=不进显存 (不 offload, 不打
+    # patch → 图不同) → 影响编译图, 正常参与编译 hash, 不 pop。
+    "VLLM_PLE_MMAP_MODE": _ple_mmap_mode,
+    # PLE mmap 标 MADV_RANDOM 关内核预读, 默认开(_ple_mmap_random 归一化)。
+    "VLLM_PLE_MMAP_RANDOM": _ple_mmap_random,
+    # PLE mmap 加载时预热 page cache, 默认关(_ple_mmap_prewarm 归一化)。
+    "VLLM_PLE_MMAP_PREWARM": _ple_mmap_prewarm,
+    # PLE mmap gather 线程数 (运行时直读, 注册仅 validate_environ + hash)。
+    "VLLM_PLE_MMAP_WORKERS": lambda: int(
+        os.environ.get("VLLM_PLE_MMAP_WORKERS", "32")
+    ),
+    # PLE mmap 每 gather 任务行数 (运行时直读, 注册仅 validate_environ + hash)。
+    "VLLM_PLE_MMAP_CHUNK": lambda: int(
+        os.environ.get("VLLM_PLE_MMAP_CHUNK", "2048")
+    ),
     # A3(sm75 参考): custom allreduce 在 cuda graph capture 时的图输入策略。
     # auto=full decode 走 registered 快路径, piecewise/prefill 回退 staging
     # buffer(sm75 图私有大 buffer 无法经 CUDA IPC 导出); registered/staging

@@ -12,7 +12,7 @@ BASE_IMAGE='vllm/vllm-openai:v0.29.0-cu129@sha256:7ef5a35d1ef8ce2cf9d671dd91eec6
 docker build --file "$ROOT/docker/Dockerfile" \
     --target final --build-arg BASE_IMAGE="$BASE_IMAGE" \
     --build-arg MAX_JOBS="${MAX_JOBS:-1}" \
-    --build-arg BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --build-arg BUILD_DATE="$(TZ='Asia/Shanghai' date +%Y-%m-%dT%H:%M:%S%:z)" \
     --build-arg SOURCE_REVISION="$SOURCE_REVISION" \
     --build-arg BASE_IMAGE_ID="$BASE_IMAGE" \
     --tag vllm-turing "$ROOT"
