@@ -125,5 +125,10 @@ ENV FLASH_QLA_SM75_PREBUILT_EXTENSION_PATH=/opt/vllm-turing/extensions/flash_qla
 FROM runtime AS final
 COPY docker/speculative /opt/vllm-turing/speculative
 RUN python3 /opt/vllm-turing/install_speculative.py
+# 容器时间统一东八区(容器内 date/日志时间戳); base 缺 tzdata 时装, 再落地 /etc/localtime
+RUN (command -v zdump >/dev/null 2>&1 || (apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq tzdata && rm -rf /var/lib/apt/lists/*)) && \
+    ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \
+    echo "Asia/Shanghai" > /etc/timezone
+ENV TZ=Asia/Shanghai
 ENTRYPOINT ["/opt/vllm-turing/entrypoint.sh"]
 LABEL ai.vllm.sm75.modes="base,mtp,dflash2"
