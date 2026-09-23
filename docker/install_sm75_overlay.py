@@ -18,28 +18,6 @@ from pathlib import Path
 # 保留注释行), 第二次跑 anchor 仍在会重复注入。probe 必须只在注入后存在。
 INJECTIONS: list[tuple[str, list[tuple[str, str, str]]]] = [
     (
-        # PP+投机 第四层(warmup 死锁, 600s NCCL watchdog 超时): PP 下 drafter 只驻留
-        # 末 rank, warmup 的 spec decode step 在 PP0/PP1 不完全对称, 观察到两 rank 对
-        # pp_broadcast(采样结果广播)的参与判定错位 -> PP0 收端已 enqueue 等待, PP1
-        # 发端已 return 进入下一步的 irecv -> 集合通信死锁, 崩溃循环。warmup 仅预热
-        # kernel 非功能必需; PP 下强制走 non-spec 形状绕开该路径, drafter kernel 推迟
-        # 到首次真实 decode 才 JIT(秒级), 不影响正确性。函数内 import get_pp_group
-        # (vllm.distributed 顶层导出), 不依赖上游 import 块。
-        "v1/worker/gpu/warmup.py",
-        [(
-            "    num_spec_steps = model_runner.num_speculative_steps\n",
-            "    from vllm.distributed import get_pp_group\n"
-            "    # SM75 PP+spec: warmup 的 spec 路径在 PP 两 rank 不对称,\n"
-            "    # pp_broadcast 参与判定错位 -> 600s NCCL watchdog 死锁。\n"
-            "    # warmup 仅预热 kernel, PP 下走 non-spec 形状绕开。\n"
-            "    if get_pp_group().world_size > 1:\n"
-            "        num_spec_steps = 0\n"
-            "    else:\n"
-            "        num_spec_steps = model_runner.num_speculative_steps\n",
-            "    if get_pp_group().world_size > 1:\n",
-        )],
-    ),
-    (
         "model_executor/layers/quantization/utils/marlin_utils_fp8.py",
         [(
             # 上游同一条 warning 文本出现 2 次(prepare_fp8_layer_for_marlin 与另一函数),
@@ -127,72 +105,6 @@ INJECTIONS: list[tuple[str, list[tuple[str, str, str]]]] = [
             "\n"
             "    attach_monitor_router(app)\n",
             "    attach_monitor_router(app)\n",
-        )],
-    ),
-    (
-        # MTP draft model 漏声明 SupportsPP: PP>1 时 draft config 校验
-        # verify_with_parallel_config -> is_pp_supported_model 抛
-        # NotImplementedError("Pipeline parallelism is not supported for this model")。
-        # 代码本身已为 PP 适配(forward 收 intermediate_tensors / __init__ 用
-        # is_last_rank 处理 lm_head), 只缺声明, 对齐已支持 PP 的 Qwen4ExpMTP。
-        # 三处: 1) import 引入 SupportsPP; 2) 类声明加 SupportsPP(Qwen3_5MoeMTP
-        # 经 MRO 一并继承); 3) __init__ 暴露 make_empty_intermediate_tensors
-        # (PP rank>0 profiling 需要, 且是 supports_pp 检出的 PP 必需属性)。
-        "model_executor/models/qwen3_5_mtp.py",
-        [(
-            "    MultiModalEmbeddings,\n"
-            "    SupportsMultiModal,\n"
-            "    _require_is_multimodal,\n"
-            ")",
-            "    MultiModalEmbeddings,\n"
-            "    SupportsMultiModal,\n"
-            "    SupportsPP,\n"
-            "    _require_is_multimodal,\n"
-            ")",
-            "    SupportsMultiModal,\n"
-            "    SupportsPP,\n",
-        ), (
-            "class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal):",
-            "class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):",
-            "nn.Module, SupportsMultiModal, SupportsPP",
-        ), (
-            "        self.logits_processor = LogitsProcessor(config.vocab_size)",
-            "        self.logits_processor = LogitsProcessor(config.vocab_size)\n"
-            "        # PP: 暴露 make_empty_intermediate_tensors(PP rank>0 profiling\n"
-            "        # 需要, 且是 supports_pp 检出的 PP 必需属性); 对齐 Qwen4ExpMTP。\n"
-            "        self.make_empty_intermediate_tensors = (\n"
-            "            self.model.make_empty_intermediate_tensors\n"
-            "        )",
-            "self.model.make_empty_intermediate_tensors",
-        ), (
-            # PP+MTP 运行时: drafter 整体放在最后一个 PP rank
-            # (gpu_model_runner "put the entire draft model on the last PP rank"),
-            # MTP 层并不按 PP 切分(range(num_mtp_layers) 全量)。但 forward 用全局
-            # get_pp_group().is_first_rank 判分支, 在 PP>1 时 last rank 走
-            # intermediate_tensors 分支, 而 drafter 的 dummy_run/propose 从不传该参
-            # -> assert 崩 (KV profiling 阶段 Worker died)。MTP 恒整体驻留单个
-            # rank, 恒走 embedding 路径即可; 尾部 is_last_rank 分支在该 rank 为
-            # True, 正常返回 hidden_states。
-            "        if get_pp_group().is_first_rank:\n",
-            "        # SM75 PP+MTP: drafter 整体驻留单个 PP rank, 恒走 embedding 路径\n"
-            "        if True:\n",
-            "        # SM75 PP+MTP: drafter 整体驻留单个 PP rank, 恒走 embedding 路径\n",
-        )],
-    ),
-    (
-        # PP+MTP 第三层: sample_tokens 里 drafter MM embedding 守卫。
-        # encoder_cache 只在 is_first_pp_rank 建 (model_runner 251-252), drafter 在
-        # last pp rank 故 encoder_cache=None; 但守卫只看 speculator.supports_mm_inputs
-        # (按 model_config 全局算, 恒 True) -> gather_mm_embeddings 需不存在的
-        # encoder_runner -> AttributeError 崩 (sample_tokens 阶段)。TP4 (PP=1) first==last,
-        # encoder_cache 正常, 不撞。加 encoder_cache is not None: 无 encoder 的 rank
-        # 本就没有 MM embedding 可 gather, draft 走纯文本即可 (mm_inputs 默认 None)。
-        "v1/worker/gpu/model_runner.py",
-        [(
-            "        if self.speculator is not None and self.speculator.supports_mm_inputs:\n",
-            "        if (self.speculator is not None and self.speculator.supports_mm_inputs\n"
-            "                and self.encoder_cache is not None):\n",
-            "                and self.encoder_cache is not None):\n",
         )],
     ),
     (
