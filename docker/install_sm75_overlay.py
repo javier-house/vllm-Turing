@@ -597,6 +597,9 @@ def main() -> None:
         "model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py",
         "model_executor/layers/quantization/utils/firefly.py",
         "model_executor/layers/quantization/utils/firefly.cu",
+        "model_executor/layers/quantization/utils/firefly_exl3.cu",
+        "model_executor/layers/quantization/exl3/__init__.py",
+        "model_executor/layers/quantization/exl3/exl3.py",
         "distributed/device_communicators/firefly_allreduce.py",
         "distributed/device_communicators/firefly_allreduce.cu",
         "distributed/device_communicators/cuda_communicator.py",
@@ -641,6 +644,25 @@ def main() -> None:
     envs_text = envs_file.read_text()
     if "vllm.envs_sm75.apply()" not in envs_text:
         envs_file.write_text(envs_text + envs_hook)
+
+    # EXL3 注册: 往 quantization/__init__.py 尾部追加 try-import (幂等)。
+    # 不能在 get_quantization_config 函数内 lazy import —— line 109 的
+    # `if quantization not in QUANTIZATION_METHODS: raise` 检查在函数体 import 之前,
+    # 首次 get_quantization_config("exl3") 必失败。尾部 import 在模块加载时即触发
+    # @register_quantization_config("exl3"), 先于任何 get_quantization_config 调用;
+    # exl3.py 反向 import 本模块的 register_quantization_config (模块体顶部已定义,
+    # 部分初始化下仍可用, 无循环)。try/except 兜底, 缺 .cu/无 CUDA 环境时静默跳过。
+    quant_init = package_root / "model_executor/layers/quantization/__init__.py"
+    exl3_hook = (
+        "\n# vllm-turing overlay: 注册 EXL3 sm75 在线解码 (idempotent; 失败静默跳过).\n"
+        "try:\n"
+        "    from vllm.model_executor.layers.quantization.exl3 import Exl3Config  # noqa: F401\n"
+        "except Exception:  # noqa: BLE001\n"
+        "    pass\n"
+    )
+    quant_text = quant_init.read_text()
+    if "quantization.exl3 import Exl3Config" not in quant_text:
+        quant_init.write_text(quant_text + exl3_hook)
 
     # PLE(ngram) 大表 NVMe mmap: 往上游 qwen4_exp ple_layer.py 末尾 append 一行,
     # 在 Qwen4ExpNGramEmbedding 类定义之后、实例化之前触发 maybe_apply (打 patch)。
