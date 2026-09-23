@@ -154,6 +154,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         attn_metadata: FlashAttentionMetadata,
         output: torch.Tensor,
         token_to_req: torch.Tensor,
+        use_prefill_config: bool = False,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -198,6 +199,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             logical_indices,
             attn_metadata.block_table,
             token_to_req,
+            use_prefill_config,
             output[:num_tokens],
         )
         return output
@@ -263,6 +265,10 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
+        # 移植 v0.30.0: decode/verify 批最多 1+num_spec 个 query token/请求,
+        # max_query_len 超过该值才是 prefill 批 → use_prefill_config 走 prefill
+        # 专用 tile 档 (同一 cudagraph 内 max_query_len 恒定, 判据 capture-stable)。
+        self._max_decode_query_len = 1 + vllm_config.num_speculative_tokens
         self.dual_chunk_attention_config = getattr(
             config, "dual_chunk_attention_config", None
         )
@@ -366,11 +372,15 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             prefix=f"{prefix}.indexer",
         )
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        # 移植 v0.30.0 PACKED selection buffer: 宽度 = output_width + 1,
+        # 尾列由 expand kernel 写每行有效条目数 (sparse attention kernel 读它
+        # 作循环上界), 永不是 token 下标; MTP skip_topk 步复用 step-0 冻结的
+        # 行, count 是列所以与内容保持配对。
         self.register_buffer(
             "topk_indices_buffer",
             torch.empty(
                 max_tokens,
-                self.indexer.output_width,
+                self.indexer.packed_output_width,
                 dtype=torch.int32,
             ),
             persistent=False,
@@ -427,7 +437,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         )
         if selected.shape != (
             num_tokens,
-            self.indexer.output_width,
+            self.indexer.packed_output_width,
         ):
             raise RuntimeError("QSA indexer returned an invalid selection shape")
         impl = cast(Qwen4ExpQSAFlashAttentionImpl, self.impl)
@@ -447,6 +457,13 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             main_metadata,
             output,
             token_to_req=side_metadata.token_to_req,
+            # 移植 v0.30.0: prefill 批 (max_query_len > decode 上限) 走 prefill
+            # 专用 tile 档; decode/verify 批走 decode 档 (差异只是 tile 调优,
+            # 不影响正确性)。FULL-graph 捕获时 max_query_len 是 uniform decode
+            # 长度, 判据在同一图内恒定 → capture-stable。
+            use_prefill_config=(
+                main_metadata.max_query_len > self._max_decode_query_len
+            ),
         )
 
     def forward(
