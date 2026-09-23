@@ -158,8 +158,13 @@ def _expand_qsa_indices_kernel(
     COMPRESS_RATIO: tl.constexpr,
     TOKEN_TOPK: tl.constexpr,
     OUTPUT_WIDTH: tl.constexpr,
+    COUNT_WIDTH: tl.constexpr,
     COLUMN_BLOCK: tl.constexpr,
 ) -> None:
+    # 移植 v0.30.0: 尾列 (index==COUNT_WIDTH-1) 写本行有效条目数 (valid count),
+    # 永不写 token 下标; sparse attention kernel 读它作 tile 循环上界, 提前退出
+    # 无效尾部 tile (对齐上游 packed selection buffer 设计)。COUNT_WIDTH =
+    # OUTPUT_WIDTH + 1。
     row = tl.program_id(0)
     columns = tl.program_id(1) * COLUMN_BLOCK + tl.arange(0, COLUMN_BLOCK)
     query_position = tl.load(query_positions_ptr + row)
@@ -205,10 +210,18 @@ def _expand_qsa_indices_kernel(
         & (token >= 0)
         & (token < sequence_length)
     )
+    is_count_col = columns == COUNT_WIDTH - 1
+    # 有效条目数 = 展开的 topk token + 未整组的因果尾 token
+    # (tail_count = (pos+1)%ratio ∈ [0, ratio-1], 与 valid 行数严格一致)。
+    valid_count = tl.where(
+        is_count_col,
+        expanded_count + tail_count,
+        -1,
+    ).to(tl.int32)
     tl.store(
         output_ptr + row * stride_output_row + columns * stride_output_column,
-        tl.where(valid, token, -1),
-        mask=(row < rows) & (columns < OUTPUT_WIDTH),
+        tl.where(valid, token, tl.where(is_count_col, valid_count, -1)),
+        mask=(row < rows) & (columns < COUNT_WIDTH),
     )
 
 
@@ -256,6 +269,14 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     request = tl.load(token_to_req_ptr + row)
     safe_request = tl.minimum(tl.maximum(request, 0), num_requests - 1)
 
+    # 移植 v0.30.0 packed selection buffer: 选区 buffer 是 [rows, TOPK+1],
+    # 尾列 (index==TOPK) 是本行有效条目数 (expand kernel 写入), 不是 token
+    # 下标。用 cdiv(min(valid_count, TOPK), BLOCK_N) 作 tile 上界: 序列短于
+    # topk 预算的行 (短 prefill / decode 早期) 提前退出无效尾部 tile —— 这是
+    # 此前"跑不满"的直接来源之一 (固定按 TOPK 全量迭代)。
+    valid_count = tl.load(indices_ptr + row * stride_indices_row + TOPK)
+    row_tiles = tl.minimum(NUM_TILES, tl.cdiv(tl.minimum(valid_count, TOPK), BLOCK_N))
+
     head_offsets = tl.arange(0, BLOCK_M)
     dim_offsets = tl.arange(0, HEAD_DIM)
     column_offsets = tl.arange(0, BLOCK_N)
@@ -275,9 +296,12 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     softmax_scale_log2: tl.constexpr = (HEAD_DIM**-0.5) * 1.4426950408889634
 
     # Dynamic bounds avoid padded main-loop iterations for uneven splits.
-    split_tile_start = split_id * NUM_TILES // NUM_SPLITS
-    split_tile_end = (split_id + 1) * NUM_TILES // NUM_SPLITS
-    for tile in range(split_tile_start, split_tile_end):
+    # 移植 v0.30.0 交错分片: 每 split 从 split_id 起、步长 NUM_SPLITS 取 tile
+    # (tile 的归属由 tile % NUM_SPLITS 决定, 每个 tile 恰被一个 split 处理)。
+    # 短行 (row_tiles < NUM_SPLITS) 时前 row_tiles 个 split 各处理 1 个 tile,
+    # 其余 split 空 (partial LSE=-inf, merge 归零) —— 连续分片在此会丢 tile,
+    # 故必须用交错分片 (对齐 0.30.0)。
+    for tile in range(split_id, row_tiles, NUM_SPLITS):
         columns = tile * BLOCK_N + column_offsets
         logical_token = tl.load(
             indices_ptr + row * stride_indices_row + columns,
@@ -738,6 +762,9 @@ def expand_qsa_block_indices_cuda(
         raise ValueError("QSA token top-k must be divisible by compression ratio")
     block_topk = token_topk // compress_ratio
     output_width = token_topk + compress_ratio - 1
+    # 移植 v0.30.0 packed buffer: 宽度 output_width+1, 尾列写每行有效条目数
+    # (sparse attention kernel 读它作循环上界), 永不是 token 下标。
+    count_width = output_width + 1
     if block_indices.shape != (query_positions.numel(), block_topk):
         raise ValueError("QSA compressed top-k has an invalid shape")
     if token_to_req.shape != query_positions.shape:
@@ -746,17 +773,17 @@ def expand_qsa_block_indices_cuda(
         raise ValueError("QSA request sequence lengths must be nonempty")
     if out is None:
         out = torch.empty(
-            (block_indices.shape[0], output_width),
+            (block_indices.shape[0], count_width),
             dtype=torch.int32,
             device=block_indices.device,
         )
-    elif out.shape != (block_indices.shape[0], output_width):
+    elif out.shape != (block_indices.shape[0], count_width):
         raise ValueError("QSA expansion output has an invalid shape")
     if not block_indices.shape[0]:
         return out
     column_block = 256
     _expand_qsa_indices_kernel[
-        (block_indices.shape[0], triton.cdiv(output_width, column_block))
+        (block_indices.shape[0], triton.cdiv(count_width, column_block))
     ](
         block_indices,
         query_positions,
@@ -773,6 +800,7 @@ def expand_qsa_block_indices_cuda(
         COMPRESS_RATIO=compress_ratio,
         TOKEN_TOPK=token_topk,
         OUTPUT_WIDTH=output_width,
+        COUNT_WIDTH=count_width,
         COLUMN_BLOCK=column_block,
         num_warps=4,
     )
@@ -790,13 +818,19 @@ def qsa_select_paged_tokens(
     compress_ratio: int,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Score, select, and expand QSA indices without host synchronization."""
+    """Score, select, and expand QSA indices without host synchronization.
+
+    返回 packed selection buffer [rows, output_width + 1]: 前 output_width 列
+    是 -1 填充的 token 下标, 尾列是每行有效条目数 (移植 v0.30.0, sparse
+    attention kernel 读尾列作循环上界)。
+    """
 
     rows = q.shape[0]
     output_width = token_topk + compress_ratio - 1
+    count_width = output_width + 1
     if out is None:
-        out = torch.empty((rows, output_width), dtype=torch.int32, device=q.device)
-    if out.shape != (rows, output_width):
+        out = torch.empty((rows, count_width), dtype=torch.int32, device=q.device)
+    if out.shape != (rows, count_width):
         raise ValueError("QSA selection output has an invalid shape")
     if not rows:
         return out
@@ -855,9 +889,16 @@ def qsa_sparse_paged_attention(
     logical_indices: torch.Tensor,
     block_table: torch.Tensor,
     token_to_req: torch.Tensor,
+    use_prefill_config: bool,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run sparse GQA directly over paged BF16 K/V caches."""
+    """Run sparse GQA directly over paged BF16 K/V caches.
+
+    logical_indices 是 packed selection buffer: [rows, selection_width + 1],
+    尾列是本行有效条目数 (expand kernel 写入, 永不是 token 下标), kernel 读
+    它作 tile 循环上界 (移植 v0.30.0)。use_prefill_config 选 prefill 专用
+    tile 档 (大 base_programs 区间, GB300 上 prefill/decode 最优配置分离)。
+    """
 
     if not q.is_cuda or not HAS_TRITON:
         raise RuntimeError("paged QSA sparse attention requires CUDA and Triton")
@@ -869,8 +910,11 @@ def qsa_sparse_paged_attention(
         raise ValueError("QSA sparse attention metadata has invalid shapes")
     if not all(k_cache.shape[:3]) or not all(block_table.shape):
         raise ValueError("QSA sparse attention cache and block table must be nonempty")
-    if logical_indices.shape[1] <= 0:
-        raise ValueError("QSA sparse attention requires a positive selection width")
+    if logical_indices.shape[1] < 2:
+        raise ValueError(
+            "QSA sparse attention requires the packed selection buffer "
+            "(selection columns plus the trailing count column)"
+        )
     if q.shape[2] != k_cache.shape[3] or q.shape[1] % k_cache.shape[2]:
         raise ValueError("QSA sparse attention requires valid grouped-query heads")
     head_dim = q.shape[2]
@@ -909,9 +953,15 @@ def qsa_sparse_paged_attention(
     block_m = triton.next_power_of_2(group_size)
     base_programs = q.shape[0] * k_cache.shape[2]
     small_profile_limit = 8 if block_m <= 8 else 4
+    # packed buffer 尾列是 valid count, 选区列数 = 宽度 - 1 (kernel 的 TOPK)。
+    topk = logical_indices.shape[1] - 1
 
     # Tuned on GB300 for the Qwen-Air TP1, TP2, and TP4 attention shapes.
     # Narrow tiles favor decode; wide tiles improve throughput for prefill.
+    # 移植 v0.30.0 use_prefill_config: 大 base_programs 区间按 decode/prefill
+    # 分档 (capture-stable: FULL-graph 捕获时 max_query_len 是 uniform
+    # decode/verify 长度, use_prefill_config 由 max_query_len >
+    # 1+num_spec_tokens 判定, 同一图内恒定)。
     if base_programs <= small_profile_limit:
         block_n, target_splits, partial_warps = 16, 64, 4
     elif base_programs < 32:
@@ -921,7 +971,11 @@ def qsa_sparse_paged_attention(
     elif base_programs <= 512:
         block_n, target_splits, partial_warps = 64, 4, 2
     else:
-        block_n, target_splits, partial_warps = 64, 1, 2
+        # 0.30.0 在 GB300 上把大区间 (bp>512) 的 prefill 档从 (64,1,2) 拆出
+        # (32,1,1) prefill 专用档; sm75 的 16 列降档在下方统一处理。
+        block_n, target_splits, partial_warps = (
+            (32, 1, 1) if use_prefill_config else (64, 1, 2)
+        )
     # Pre-Ampere (sm75/sm70): 64 列 tile 在 HEAD_DIM=256 下超过 Turing 64 KiB
     # shared-memory 上限 (Triton OutOfResources: Required 81920 > limit 65536,
     # kernel 在 SM75 上根本 launch 不了)。prefill (base_programs>256) 选中 64 列
@@ -929,11 +983,14 @@ def qsa_sparse_paged_attention(
     # 不触发 —— 直到首次真实 prefill (推理期 JIT) 才暴露。对齐 1Cat #441: 降到
     # 16 列 + 4 warp (64 列 tile 在 V100 上还会串行化 D=256 tensor-core 工作),
     # 在 64..2048 行 prefill 区间实测比此前可跑的最优 profile 快 1.16-2.6x。
-    if not current_platform.has_device_capability(80) and block_n == 64:
+    # sm75 无 bf16 tensor-core 且 shared mem 紧, 32 列 (移植自 0.30.0 的 GB300
+    # prefill 档) 同样未调优, 一并降到 16 列 —— use_prefill_config 的区分在
+    # sm75 上被此降档覆盖 (两档都落到 16 列, 仅 warp 数差异, 安全)。
+    if not current_platform.has_device_capability(80) and block_n >= 32:
         block_n = 16
         partial_warps = 4
 
-    num_tiles = triton.cdiv(logical_indices.shape[1], block_n)
+    num_tiles = triton.cdiv(topk, block_n)
     # Avoid empty splits when the selection width is smaller than the profile.
     max_useful_splits = 1 << (num_tiles.bit_length() - 1)
     num_splits = min(max_useful_splits, target_splits)
@@ -980,7 +1037,7 @@ def qsa_sparse_paged_attention(
         q.shape[0],
         k_cache.shape[0],
         block_table.shape[0],
-        TOPK=logical_indices.shape[1],
+        TOPK=topk,
         PAGE_SIZE=k_cache.shape[1],
         PAGE_TABLE_WIDTH=block_table.shape[1],
         GROUP_SIZE=group_size,

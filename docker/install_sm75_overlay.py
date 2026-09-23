@@ -187,6 +187,34 @@ INJECTIONS: list[tuple[str, list[tuple[str, str, str]]]] = [
                 "            head_size=self.index_head_dim,\n"
                 "            dtype=vllm_config.model_config.dtype,",
             ),
+            # 移植 v0.30.0 PACKED selection buffer: 加 packed_output_width
+            # property (= output_width + 1, 尾列 valid count) 并让 forward 的
+            # fallback (metadata 缺失 / MTP skip_topk) 按 packed 宽度填充,
+            # 与整文件覆盖版 ops/qsa.py 的 packed 流一致。
+            (
+                "    @property\n"
+                "    def output_width(self) -> int:\n"
+                "        return self.token_topk + self.compress_ratio - 1\n",
+                "    @property\n"
+                "    def output_width(self) -> int:\n"
+                "        return self.token_topk + self.compress_ratio - 1\n"
+                "\n"
+                "    @property\n"
+                "    def packed_output_width(self) -> int:\n"
+                "        # 选区 buffer 宽度 = output_width + 1: 尾列是本行有效条目\n"
+                "        # 数 (expand kernel 写), sparse attention kernel 读它作循环上界。\n"
+                "        return self.output_width + 1\n",
+                "def packed_output_width(self) -> int:",
+            ),
+            (
+                "            result = torch.full(\n"
+                "                (hidden_states.shape[0], self.output_width),\n"
+                "                -1,",
+                "            result = torch.full(\n"
+                "                (hidden_states.shape[0], self.packed_output_width),\n"
+                "                -1,",
+                "                (hidden_states.shape[0], self.packed_output_width),",
+            ),
         ],
     ),
     (
