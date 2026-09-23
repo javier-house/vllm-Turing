@@ -57,6 +57,19 @@ def _int8_prefill_linear():
 
     return int8_prefill_linear
 
+
+def _tp_rank() -> int:
+    """惰性 import TP rank (同 LinearBase 避开顶层循环; 运行时 vllm 已全加载)。
+
+    TP 切分时每 rank 只装 1/tp 的 trellis/suh/svh 段 (128 倍数, Hadamard 按
+    128x128 tile 自包含 -> 每 rank 独立解码免通信)。TP1 返回 0。
+    """
+    from vllm.distributed.parallel_state import (
+        get_tensor_model_parallel_rank,
+    )
+
+    return get_tensor_model_parallel_rank()
+
 # ---------------------------------------------------------------------------
 # firefly_exl3.cu 懒加载 (镜像 firefly.py 的 _load_cuda_mod)
 # ---------------------------------------------------------------------------
@@ -204,18 +217,63 @@ class Exl3LinearMethod(QuantizeMethodBase):
                 return
             else:
                 raise ValueError(f"unknown EXL3 suffix={suffix}")
-            if tuple(dest.shape) != tuple(loaded.shape):
+            # TP 切分: checkpoint 存全量张量, 每 rank 只装 1/tp 段 (128 倍数, Hadamard
+            # 按 128x128 tile 自包含 -> 每 rank 独立解码免通信)。逐维判断: loaded>dest
+            # 则该维被 TP 切 -> 取本 rank 段 [tp_rank*len : (tp_rank+1)*len]; 相等 ->
+            # replicated 取全量。覆盖 trellis(dim0=K,dim1=N)/suh(K)/svh(N) 及 qkv 输出。
+            src = loaded
+            for d in range(src.dim()):
+                if src.shape[d] > dest.shape[d]:
+                    start = _tp_rank() * dest.shape[d]
+                    src = src.narrow(d, start, dest.shape[d])
+                elif src.shape[d] < dest.shape[d]:
+                    raise RuntimeError(
+                        f"EXL3 {suffix} load: loaded dim{d}={src.shape[d]} < "
+                        f"dest={dest.shape[d]} (unexpected) shard={shard_idx}"
+                    )
+            if tuple(src.shape) != tuple(dest.shape):
                 raise RuntimeError(
                     f"EXL3 {suffix} load shape mismatch shard={shard_idx}: "
-                    f"dest {tuple(dest.shape)} != loaded {tuple(loaded.shape)}"
+                    f"dest {tuple(dest.shape)} != src {tuple(src.shape)}"
                 )
-            dest.copy_(loaded.to(dest.dtype))
+            dest.copy_(src.to(dest.dtype))
 
         return weight_loader
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # 在线解码方案: trellis 原样常驻, 无需预处理。
-        return None
+        # 加载时算一次 per-channel c_n (每列 amax/127): c_n 只依赖权重(常量), 不在每步
+        # 在线解码时重算 —— 否则 decode step 每步都白跑一次 amax 扫描。存成每层 [N]
+        # 小数组(float32, 1.5B ~几十 KB/层), 不是常驻 int8 权重副本, 72GB MoE 也装得下。
+        mod = _load_exl3_cuda_mod()
+        if mod is None:
+            return  # 无 CUDA ext (非 GPU 环境) 时跳过, apply 时会再报
+        K = layer._exl3_K
+        out_sizes = layer._exl3_output_partition_sizes
+        n_shards = layer._exl3_n_shards
+        bits = layer._exl3_bits
+        N = sum(out_sizes)
+        dev = layer.trellis.device
+        c_n = torch.empty(N, dtype=torch.float32, device=dev)
+        full_n16 = layer.trellis.shape[1]  # 全 N/16 (fused trellis 的 dim1)
+        for i in range(n_shards):
+            out_start = sum(out_sizes[:i])
+            n_shard = out_sizes[i]
+            # 解 shard 的 W_hat fp16 [K, n_shard] 求每列 amax (QUANT=false 全量解码)
+            w_hat = torch.empty(K, n_shard, dtype=torch.float16, device=dev)
+            mod.exl3_decode(
+                layer.trellis.data,
+                layer.suh.data[i],
+                layer.svh.data[out_start : out_start + n_shard],
+                w_hat,
+                out_start // 16,  # nb_offset (16-tile N 起点)
+                full_n16,  # packed_blocks_n (全 N/16)
+                bits,
+            )
+            # per-channel (列) amax / 127 = GEMM scale_b
+            c_n[out_start : out_start + n_shard] = (
+                w_hat.abs().amax(dim=0) / 127.0
+            )
+        layer._exl3_c_n = c_n  # apply 用 (常驻小数组, 非 int8 权重)
 
     @torch.compiler.disable
     def apply(
@@ -225,7 +283,7 @@ class Exl3LinearMethod(QuantizeMethodBase):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # @torch.compiler.disable: apply 内含 os.path (cu 懒加载) + 自定义 CUDA kernel
-        # (mod.exl3_linear_dequant) + per-shard 循环, torch.compile (dynamo) 无法 trace,
+        # (mod.exl3_decode_to_int8) + per-shard 循环, torch.compile (dynamo) 无法 trace,
         # graph break 转 eager 执行。vLLM 默认开 inductor 编译, 不加会撞 dynamo 报错。
         mod = _load_exl3_cuda_mod()
         if mod is None:
@@ -239,6 +297,8 @@ class Exl3LinearMethod(QuantizeMethodBase):
         dev = x.device
         out_dtype = x.dtype
 
+        c_n_full = layer._exl3_c_n  # 加载时算好的 per-channel scale [N]
+        full_n16 = layer.trellis.shape[1]  # 全 N/16 (fused trellis 的 dim1)
         # 激活 -> fp16 2D (GEMM 输入)
         x_fp16 = x.to(torch.float16)
         orig_shape = x_fp16.shape
@@ -251,22 +311,22 @@ class Exl3LinearMethod(QuantizeMethodBase):
         for i in range(n_shards):
             out_start = sum(out_sizes[:i])
             n_shard = out_sizes[i]
-            out_tiles_start = sum(s // 16 for s in out_sizes[:i])
-            out_tiles_shard = n_shard // 16
-            # 切 shard 压缩张量。trellis 沿 dim1 的 3D 切片非连续, kernel 按连续
-            # [K/16, N/16, 16*bits] 算指针偏移, 必须 contiguous (单 shard 级拷贝, 非全量)。
-            trellis_shard = layer.trellis.data[
-                :, out_tiles_start : out_tiles_start + out_tiles_shard, :
-            ].contiguous()
-            suh_shard = layer.suh.data[i]
-            svh_shard = layer.svh.data[out_start : out_start + n_shard]
-            # 在线解码 -> int8 [n_shard, K] + c_n [n_shard]
+            # fused decode+quantize: 全量 trellis/suh/svh + shard 偏移(nb_offset),
+            # 单 kernel 解完直接量化写 int8 (免 W_hat fp16 中间流量, 免每步 .contiguous()
+            # 切片拷贝)。c_n 用加载时算好的本 shard 段。
             w_int8 = torch.empty(n_shard, K, dtype=torch.int8, device=dev)
-            c_n = torch.empty(n_shard, dtype=torch.float32, device=dev)
-            mod.exl3_linear_dequant(trellis_shard, suh_shard, svh_shard,
-                                    w_int8, c_n, bits)
+            mod.exl3_decode_to_int8(
+                layer.trellis.data,
+                layer.suh.data[i],
+                layer.svh.data[out_start : out_start + n_shard],
+                c_n_full[out_start : out_start + n_shard],
+                w_int8,
+                out_start // 16,  # nb_offset (16-tile N 起点)
+                full_n16,  # packed_blocks_n (全 N/16)
+                bits,
+            )
             # firefly int8 GEMM (cutlass_scaled_mm, sm75 原生 IMMA)
-            y = int8_prefill_linear(x2d, w_int8, c_n)  # [rows, n_shard]
+            y = int8_prefill_linear(x2d, w_int8, c_n_full[out_start : out_start + n_shard])
             outputs.append(y)
 
         y = torch.cat(outputs, dim=1) if n_shards > 1 else outputs[0]

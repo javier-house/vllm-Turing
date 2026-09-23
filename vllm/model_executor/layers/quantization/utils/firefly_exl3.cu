@@ -237,17 +237,31 @@ __device__ __forceinline__ __half2 shuffle_had_h2x32(__half2 v, int lane_id) {
   return v;
 }
 
+// int8 量化: w/c -> clamp(round, ±127)。c<=0 安全返回 0。
+__device__ __forceinline__ int8_t exl3_quant(float w, float c) {
+  int v = (c > 0.f) ? __float2int_rn(w / c) : 0;
+  if (v > 127) v = 127;
+  if (v < -127) v = -127;
+  return (int8_t)v;
+}
+
 // reconstruct.cu reconstruct_had_tile 移植(mul1 特化): 128×128 tile, 256 线程,
 // 解 8×8 个 16×16 子 tile -> 列 Hadamard(4 行 warp 蝶式 + shuffle) -> 行 Hadamard
-// (融进 store, 128 点/warp) + suh/svh scale。输出 W_hat fp16 [K, N](K-major)。
+// (融进 store, 128 点/warp) + suh/svh scale。
+//   QUANT=false: 输出 W_hat fp16 [K, N](K-major) 到 g_unpacked (供加载时算 c_n)。
+//   QUANT=true : 解码值直接量化+转置写 int8 out_int8[n*K+k] (用预存 c_n[n]),
+//                不落 W_hat fp16 global —— 消掉 ~4 字节/权重的中间流量, 是 decode
+//                step 提速关键 (在线解码每步都跑, 流量减半)。
 // r_scale = 1/sqrt(128), 列+行两次各一次, 合 1/128。
 constexpr int RH_THREADS = 256;
 
-template <int K>
+template <int K, bool QUANT>
 __device__ __forceinline__ void exl3_had_tile(
-    __half* __restrict__ g_unpacked, const uint16_t* __restrict__ g_packed,
+    __half* __restrict__ g_unpacked, int8_t* __restrict__ out_int8,
+    const uint16_t* __restrict__ g_packed,
     const __half* __restrict__ suh, const __half* __restrict__ svh,
-    int packed_blocks_n) {
+    int packed_blocks_n, int nb_offset, const float* __restrict__ c_n,
+    int Kdim) {
   constexpr int packed_size = 16 * K;  // uint16s per 16x16 tile
   constexpr float r_scale = 0.08838834764831845f;
 
@@ -256,7 +270,9 @@ __device__ __forceinline__ void exl3_had_tile(
   const int warp_id = t >> 5;
   const int kb = blockIdx.y;
   const int nb = blockIdx.x;
-  const int n = nb * 8;
+  // nb_offset: 本 shard 在全 trellis 的 16-tile N 起点 (fused qkv 切 shard 免 .contiguous())。
+  // 全量解码 (QUANT=false 算 c_n) 时 nb_offset=0, packed_blocks_n=N_total/16。
+  const int n = nb_offset + nb * 8;
   const int row_len = gridDim.x * 128;
 
   __shared__ uint32_t s_packed[8][8][packed_size / 2];
@@ -374,78 +390,95 @@ __device__ __forceinline__ void exl3_had_tile(
         __hmul2(__floats2half2_rn(s0 - s1, d0 - d1), rs2);
     h01 = shuffle_had_h2x32(h01, lane_id);
     h23 = shuffle_had_h2x32(h23, lane_id);
-    const __half2 su2 = __half2half2(suh[kb * 128 + R]);
-    half4 v;
-    v.x = __hmul2(__hmul2(h01, su2), sv4.x);
-    v.y = __hmul2(__hmul2(h23, su2), sv4.y);
-    *((half4*)(g_unpacked + (size_t)(kb * 128 + R) * row_len + nb * 128 +
-                 lane_id * 4)) = v;
+    // h01 = 行 Hadamard 后的 [4l, 4l+1] 两列 (未乘 suh/svh); h23 = [4l+2, 4l+3]
+    const int k = kb * 128 + R;
+    if constexpr (QUANT) {
+      // 直接量化+转置写 int8: W_hat[k, n] = h * suh[k] * svh[n] -> clamp(W_hat/c_n[n])。
+      // c_n 加载时算好(整列 amax/127), 此处每步只做 decode+量化, 不落 fp16 global。
+      const float suf = __half2float(suh[k]);
+      const int n0 = nb * 128 + lane_id * 4;
+      out_int8[(size_t)n0 * Kdim + k] =
+          exl3_quant(__low2float(h01) * suf * __half2float(svh[n0]), c_n[n0]);
+      out_int8[(size_t)(n0 + 1) * Kdim + k] =
+          exl3_quant(__high2float(h01) * suf * __half2float(svh[n0 + 1]),
+                     c_n[n0 + 1]);
+      out_int8[(size_t)(n0 + 2) * Kdim + k] =
+          exl3_quant(__low2float(h23) * suf * __half2float(svh[n0 + 2]),
+                     c_n[n0 + 2]);
+      out_int8[(size_t)(n0 + 3) * Kdim + k] =
+          exl3_quant(__high2float(h23) * suf * __half2float(svh[n0 + 3]),
+                     c_n[n0 + 3]);
+    } else {
+      const __half2 su2 = __half2half2(suh[k]);
+      half4 v;
+      v.x = __hmul2(__hmul2(h01, su2), sv4.x);
+      v.y = __hmul2(__hmul2(h23, su2), sv4.y);
+      *((half4*)(g_unpacked + (size_t)k * row_len + nb * 128 + lane_id * 4)) =
+          v;
+    }
   }
 }
 
-template <int K>
+// QUANT 参数化解码 kernel: QUANT=false 解 W_hat fp16 [K,N](加载时算 c_n),
+// QUANT=true 解完直接量化+转置写 int8 [n_shard, K](每步, 预存 c_n, 免 W_hat temp)。
+// nb_offset(16-tile N 起点)+ packed_blocks_n(全 N/16) 支持从 fused 全 trellis 解
+// 单个 shard(免 Python 端 .contiguous() 切片拷贝)。
+template <int K, bool QUANT>
 __global__ __launch_bounds__(RH_THREADS) void exl3_decode_kernel(
-    __half* __restrict__ g_unpacked, const uint16_t* __restrict__ g_packed,
+    __half* __restrict__ g_unpacked, int8_t* __restrict__ out_int8,
+    const uint16_t* __restrict__ g_packed,
     const __half* __restrict__ suh, const __half* __restrict__ svh,
-    int packed_blocks_n) {
-  exl3_had_tile<K>(g_unpacked, g_packed, suh, svh, packed_blocks_n);
+    const float* __restrict__ c_n, int packed_blocks_n, int nb_offset,
+    int Kdim) {
+  exl3_had_tile<K, QUANT>(g_unpacked, out_int8, g_packed, suh, svh,
+                          packed_blocks_n, nb_offset, c_n, Kdim);
 }
 
 // ---- int8 转置: fp16 [K, N](K-major) -> int8 [N, K] 行主序 + c_n[N]=列 amax/127 ----
-// 每 block 负责 128 个 output channel(列), 沿完整 K 求 per-channel amax 再量化转置。
-// 关键: c_n[n] 必须用整列(K 维全部)的 amax —— 若按 kb tile 分块各自 amax 会互相覆盖
-// (后写赢), 导致 c_n 偏小 -> round(W/c) 大量 overflow clamp 到 ±127 -> 每层 GEMM 误差
-// 逐层累积(28 层 cos 掉到 ~0.06) -> 输出乱码。故 grid 只按 N 切(N/128), 两遍走 K。
-__global__ __launch_bounds__(RH_THREADS) void exl3_int8_transpose_kernel(
+// 拆两个都按 (N/128, K/128) tiling 的 kernel (各 ~144 block, 占满 28-SM 卡)。
+// 关键: c_n[n] 必须用整列(K 维全部)的 amax。原单 kernel grid=(N/128) 只有 12 block,
+// 且每 block 串行扫 K/128 chunk -> 只跑到 ~5% 带宽, decode step 的绝对瓶颈。
+// 现拆: (A) 每 128x128 tile 各求本 tile 128 行的列 amax, atomicMax 合并成全列 amax
+// (非负 float 的 int 位序可比, c_n 预清零); (B) 全列 amax 就绪后按 tile 量化写 int8。
+// 若退回 per-tile amax (不合并) 会让 c_n 偏小 -> round(W/c) 大量 overflow clamp ->
+// 单层 GEMM cos 掉到 0.906 -> 28 层累积乱码, 故 (A) 必须跨 kb-block atomicMax。
+
+// 非负 float 的 atomicMax (c_n 恒 >= 0, int 位序与 float 序一致)。
+__device__ __forceinline__ void atomicMaxFloat(float* addr, float val) {
+  atomicMax(reinterpret_cast<int*>(addr), __float_as_int(val));
+}
+
+// (A) 每 tile 列 amax -> atomicMax 全列 amax 进 c_n (host 预 c_n.zero_())。
+// 只 128 线程(每列一线程), 每 tile 128 行 x 128 列 coalesced 读。
+__global__ __launch_bounds__(128) void exl3_col_amax_kernel(
+    const __half* __restrict__ w_hat,  // [K, N] fp16 K-major
+    float* __restrict__ c_n,  // [N] (pre-zeroed, 存全列 amax)
+    int K, int N) {
+  const int nb = blockIdx.x, kb = blockIdx.y, t = threadIdx.x;
+  const size_t base = (size_t)kb * 128 * N + nb * 128 + t;
+  float m = 0.f;
+#pragma unroll 4
+  for (int r = 0; r < 128; ++r)
+    m = fmaxf(m, fabsf(__half2float(w_hat[base + (size_t)r * N])));
+  atomicMaxFloat(c_n + nb * 128 + t, m);
+}
+
+// (B) 全列 amax 就绪后按 tile 量化 + 转置写 int8 [N, K] 行主序。
+__global__ __launch_bounds__(RH_THREADS) void exl3_quantize_kernel(
     const __half* __restrict__ w_hat,  // [K, N] fp16 K-major
     int8_t* __restrict__ out_int8,  // [N, K] 行主序
-    float* __restrict__ c_n,  // [N]
+    const float* __restrict__ c_n,  // [N] (全列 amax/127, = GEMM scale_b)
     int K, int N) {
-  const int nb = blockIdx.x;  // 每 block 128 列
-  const int t = threadIdx.x;
-  __shared__ __half s_tile[128 * 128];
-  __shared__ float s_c[128];
-
-  // Pass 1: per-channel(列) amax 沿完整 K, 分 128 k-chunk 经 smem 累积
-  // (前 128 线程各占一列, 每 chunk 更新 max)。W_hat [K,N] K-major, 每行 128 列连续。
-  float m = 0.f;
-  for (int kch = 0; kch < K / 128; ++kch) {
-    for (int u = t; u < 128 * 128; u += RH_THREADS) {
-      const int k = u >> 7, n = u & 127;
-      s_tile[u] = w_hat[(size_t)(kch * 128 + k) * N + nb * 128 + n];
-    }
-    __syncthreads();
-    if (t < 128) {
-#pragma unroll 4
-      for (int r = 0; r < 128; ++r)
-        m = fmaxf(m, fabsf(__half2float(s_tile[r * 128 + t])));
-    }
-    __syncthreads();
-  }
-  if (t < 128) {
-    s_c[t] = m / 127.0f;        // per-channel scale, 喂量化
-    c_n[nb * 128 + t] = s_c[t];  // 全局 per-channel scale (= GEMM scale_b)
-  }
-  __syncthreads();
-
-  // Pass 2: 量化 + 转置写 int8 [N, K]: out[n*K + k] (分 128 k-chunk)
-  for (int kch = 0; kch < K / 128; ++kch) {
-    for (int u = t; u < 128 * 128; u += RH_THREADS) {
-      const int k = u >> 7, n = u & 127;
-      s_tile[u] = w_hat[(size_t)(kch * 128 + k) * N + nb * 128 + n];
-    }
-    __syncthreads();
-    for (int u = t; u < 128 * 128; u += RH_THREADS) {
-      const int k = u >> 7, n = u & 127;
-      const int ng = nb * 128 + n;
-      const float c = s_c[n];
-      const float w = __half2float(s_tile[u]);
-      int v = (c > 0.f) ? __float2int_rn(w / c) : 0;
-      if (v > 127) v = 127;
-      if (v < -127) v = -127;
-      out_int8[(size_t)ng * K + kch * 128 + k] = (int8_t)v;
-    }
-    __syncthreads();
+  const int nb = blockIdx.x, kb = blockIdx.y, t = threadIdx.x;
+  for (int u = t; u < 128 * 128; u += RH_THREADS) {
+    const int k = u >> 7, n = u & 127;
+    const int ng = nb * 128 + n;
+    const float c = c_n[ng];
+    const float w = __half2float(w_hat[(size_t)(kb * 128 + k) * N + ng]);
+    int v = (c > 0.f) ? __float2int_rn(w / c) : 0;
+    if (v > 127) v = 127;
+    if (v < -127) v = -127;
+    out_int8[(size_t)ng * K + kb * 128 + k] = (int8_t)v;
   }
 }
 
@@ -453,32 +486,21 @@ __global__ __launch_bounds__(RH_THREADS) void exl3_int8_transpose_kernel(
 
 // ---- host launcher + binding(镜像 firefly.cu) ----
 
-// 按 K 选择解码 kernel 实例(K=trellis.shape[0]*16 的每 16 行 bits, 即 bpw)。
-// exl3_decode: trellis [K/16, N/16, 16*K] int16 -> W_hat fp16 [K, N](K-major)。
-// bits(=bpw) 1..8 直接 switch 实例化对应 kernel(不经过泛型 dispatch, 避免
-// f<1>() 被解析为 f<1 比较)。
-void exl3_decode(at::Tensor packed, at::Tensor suh, at::Tensor svh,
-                 at::Tensor out, int64_t bits) {
-  TORCH_CHECK(packed.dim() == 3, "packed must be [K/16, N/16, 16*K]");
-  const int Kblk = packed.size(0);
-  const int Nblk16 = packed.size(1);
-  const int K = Kblk * 16;
-  const int N = Nblk16 * 16;
-  TORCH_CHECK(K % 128 == 0, "EXL3 K(=in) must be multiple of 128, got ", K);
-  TORCH_CHECK(N % 128 == 0, "EXL3 N(=out) must be multiple of 128, got ", N);
-  TORCH_CHECK(packed.size(2) == 16 * bits, "packed last dim must be 16*bits");
-  TORCH_CHECK(out.size(0) == K && out.size(1) == N, "out must be [K, N]");
-  const cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
-  const uint16_t* packed_ptr =
-      static_cast<const uint16_t*>(packed.data_ptr());
-  const __half* suh_ptr = static_cast<const __half*>(suh.data_ptr());
-  const __half* svh_ptr = static_cast<const __half*>(svh.data_ptr());
-  __half* out_ptr = static_cast<__half*>(out.data_ptr());
-  const dim3 grid(N / 128, K / 128);
+// 按 bits 实例化解码 kernel 的 switch (QUANT 模板参选 fused 与否)。
+// exl3_decode: EXL3 trellis(全量 fused, 经 nb_offset/packed_blocks_n 切单 shard)
+//   -> W_hat fp16 [K, n_shard](QUANT=false, 加载时算 c_n 用)。
+// exl3_decode_to_int8: 同上但 QUANT=true, 解完直接量化+转置写 int8 [n_shard, K]
+//   (每步在线解码用, 预存 c_n, 免 W_hat fp16 临时 + 免 Python 端 .contiguous() 切片)。
+// bits(=bpw) 1..8 直接 switch(不经过泛型 dispatch, 避免 f<1>() 被解析为比较)。
+template <bool QUANT>
+static void launch_decode(
+    int bits, dim3 grid, cudaStream_t stream, __half* w_hat, int8_t* out_int8,
+    const uint16_t* packed, const __half* suh, const __half* svh,
+    const float* c_n, int packed_blocks_n, int nb_offset, int Kdim) {
 #define EXL3_LAUNCH(bits_v)                                        \
-  exl3_decode_kernel<bits_v><<<grid, RH_THREADS, 0, stream>>>(     \
-      out_ptr, packed_ptr, suh_ptr, svh_ptr, Nblk16)
-  switch ((int)bits) {
+  exl3_decode_kernel<bits_v, QUANT><<<grid, RH_THREADS, 0, stream>>>( \
+      w_hat, out_int8, packed, suh, svh, c_n, packed_blocks_n, nb_offset, Kdim)
+  switch (bits) {
     case 1: EXL3_LAUNCH(1); break;
     case 2: EXL3_LAUNCH(2); break;
     case 3: EXL3_LAUNCH(3); break;
@@ -490,6 +512,48 @@ void exl3_decode(at::Tensor packed, at::Tensor suh, at::Tensor svh,
     default: TORCH_CHECK(false, "unsupported EXL3 bits: ", bits);
   }
 #undef EXL3_LAUNCH
+}
+
+// exl3_decode: 全量 trellis 的单个 shard -> W_hat fp16 [K, n_shard] (QUANT=false)。
+void exl3_decode(at::Tensor packed, at::Tensor suh, at::Tensor svh,
+                 at::Tensor out, int64_t nb_offset, int64_t packed_blocks_n,
+                 int64_t bits) {
+  TORCH_CHECK(packed.dim() == 3, "packed must be [K/16, N/16, 16*bits]");
+  const int K = packed.size(0) * 16;
+  const int n_shard = out.size(1);
+  TORCH_CHECK(out.size(0) == K, "out must be [K, n_shard]");
+  TORCH_CHECK(packed.size(2) == 16 * bits, "packed last dim must be 16*bits");
+  const cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+  launch_decode<false>(
+      (int)bits, dim3(n_shard / 128, K / 128), stream,
+      static_cast<__half*>(out.data_ptr()), nullptr,
+      static_cast<const uint16_t*>(packed.data_ptr()),
+      static_cast<const __half*>(suh.data_ptr()),
+      static_cast<const __half*>(svh.data_ptr()), nullptr,
+      (int)packed_blocks_n, (int)nb_offset, K);
+}
+
+// exl3_decode_to_int8: 全量 trellis 的单个 shard -> int8 [n_shard, K] (QUANT=true,
+// 解码+量化+转置单 kernel 融合, 用预存 c_n, 免 W_hat fp16 中间流量)。
+void exl3_decode_to_int8(at::Tensor packed, at::Tensor suh, at::Tensor svh,
+                         at::Tensor c_n, at::Tensor out_int8,
+                         int64_t nb_offset, int64_t packed_blocks_n,
+                         int64_t bits) {
+  TORCH_CHECK(packed.dim() == 3, "packed must be [K/16, N/16, 16*bits]");
+  const int K = packed.size(0) * 16;
+  const int n_shard = out_int8.size(0);
+  TORCH_CHECK(out_int8.size(1) == K, "out_int8 must be [n_shard, K]");
+  TORCH_CHECK(c_n.size(0) == n_shard, "c_n must be [n_shard]");
+  TORCH_CHECK(packed.size(2) == 16 * bits, "packed last dim must be 16*bits");
+  const cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+  launch_decode<true>(
+      (int)bits, dim3(n_shard / 128, K / 128), stream, nullptr,
+      static_cast<int8_t*>(out_int8.data_ptr()),
+      static_cast<const uint16_t*>(packed.data_ptr()),
+      static_cast<const __half*>(suh.data_ptr()),
+      static_cast<const __half*>(svh.data_ptr()),
+      static_cast<const float*>(c_n.data_ptr()), (int)packed_blocks_n,
+      (int)nb_offset, K);
 }
 
 // exl3_int8_transpose: W_hat fp16 [K, N] -> int8 [N, K] + c_n[N]。
@@ -505,27 +569,23 @@ void exl3_int8_transpose(at::Tensor w_hat, at::Tensor out_int8,
   const __half* w_ptr = static_cast<const __half*>(w_hat.data_ptr());
   int8_t* out_ptr = static_cast<int8_t*>(out_int8.data_ptr());
   float* c_ptr = static_cast<float*>(c_n.data_ptr());
-  // grid 只按 N 切: 每 block 128 列沿完整 K 求 amax (见 kernel 注释, 按 kb 切会覆盖 c_n)
-  const dim3 grid(N / 128);
-  exl3_int8_transpose_kernel<<<grid, RH_THREADS, 0, stream>>>(w_ptr, out_ptr,
-                                                              c_ptr, K, N);
-}
-
-// 单调用便捷: trellis -> int8 [N, K] + c_n(内部分配 W_hat fp16 [K,N] 临时)。
-void exl3_linear_dequant(at::Tensor packed, at::Tensor suh, at::Tensor svh,
-                         at::Tensor out_int8, at::Tensor c_n, int64_t bits) {
-  const int K = packed.size(0) * 16;
-  const int N = packed.size(1) * 16;
-  auto w_hat = torch::empty({K, N}, packed.options().dtype(torch::kHalf));
-  exl3_decode(packed, suh, svh, w_hat, bits);
-  exl3_int8_transpose(w_hat, out_int8, c_n);
+  const dim3 grid(N / 128, K / 128);
+  // (A) 全列 amax: c_n 预清零, 每 128x128 tile 各求本 tile 列 amax 再 atomicMax 合并
+  //     出整列 amax (跨 kb-block, 避免原单 kernel 按 kb 分块互相覆盖 -> c_n 偏小 ->
+  //     量化 overflow -> 乱码)。
+  c_n.zero_();
+  exl3_col_amax_kernel<<<grid, 128, 0, stream>>>(w_ptr, c_ptr, K, N);
+  // c_n: amax -> amax/127 (= per-channel scale = cutlass scale_b)
+  c_n.div_(127.0f);
+  // (B) 量化 + 转置写 int8 [N, K] (grid 全 tile, 占满 SM)
+  exl3_quantize_kernel<<<grid, RH_THREADS, 0, stream>>>(w_ptr, out_ptr, c_ptr, K, N);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {  // NOLINT
   m.def("exl3_decode", &exl3_decode,
-        "EXL3 trellis -> fp16 [K,N] W_hat (mul1, sm75-safe)");
+        "EXL3 trellis shard -> fp16 [K, n_shard] W_hat (加载时算 c_n)");
+  m.def("exl3_decode_to_int8", &exl3_decode_to_int8,
+        "EXL3 trellis shard -> int8 [n_shard, K] (fused decode+quantize, 每步)");
   m.def("exl3_int8_transpose", &exl3_int8_transpose,
         "EXL3 fp16 [K,N] -> int8 [N,K] + per-channel c_n[N]");
-  m.def("exl3_linear_dequant", &exl3_linear_dequant,
-        "EXL3 trellis -> int8 [N,K] + c_n (fused decode+transpose)");
 }
