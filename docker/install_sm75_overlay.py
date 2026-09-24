@@ -108,56 +108,6 @@ INJECTIONS: list[tuple[str, list[tuple[str, str, str]]]] = [
         )],
     ),
     (
-        # MTP draft model 漏声明 SupportsPP: PP>1 时 draft config 校验
-        # verify_with_parallel_config -> is_pp_supported_model 抛
-        # NotImplementedError("Pipeline parallelism is not supported for this model")。
-        # 代码本身已为 PP 适配(forward 收 intermediate_tensors / __init__ 用
-        # is_last_rank 处理 lm_head), 只缺声明, 对齐已支持 PP 的 Qwen4ExpMTP。
-        # 三处: 1) import 引入 SupportsPP; 2) 类声明加 SupportsPP(Qwen3_5MoeMTP
-        # 经 MRO 一并继承); 3) __init__ 暴露 make_empty_intermediate_tensors
-        # (PP rank>0 profiling 需要, 且是 supports_pp 检出的 PP 必需属性)。
-        "model_executor/models/qwen3_5_mtp.py",
-        [(
-            "    MultiModalEmbeddings,\n"
-            "    SupportsMultiModal,\n"
-            "    _require_is_multimodal,\n"
-            ")",
-            "    MultiModalEmbeddings,\n"
-            "    SupportsMultiModal,\n"
-            "    SupportsPP,\n"
-            "    _require_is_multimodal,\n"
-            ")",
-            "    SupportsMultiModal,\n"
-            "    SupportsPP,\n",
-        ), (
-            "class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal):",
-            "class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):",
-            "nn.Module, SupportsMultiModal, SupportsPP",
-        ), (
-            "        self.logits_processor = LogitsProcessor(config.vocab_size)",
-            "        self.logits_processor = LogitsProcessor(config.vocab_size)\n"
-            "        # PP: 暴露 make_empty_intermediate_tensors(PP rank>0 profiling\n"
-            "        # 需要, 且是 supports_pp 检出的 PP 必需属性); 对齐 Qwen4ExpMTP。\n"
-            "        self.make_empty_intermediate_tensors = (\n"
-            "            self.model.make_empty_intermediate_tensors\n"
-            "        )",
-            "self.model.make_empty_intermediate_tensors",
-        ), (
-            # PP+MTP 运行时: drafter 整体放在最后一个 PP rank
-            # (gpu_model_runner "put the entire draft model on the last PP rank"),
-            # MTP 层并不按 PP 切分(range(num_mtp_layers) 全量)。但 forward 用全局
-            # get_pp_group().is_first_rank 判分支, 在 PP>1 时 last rank 走
-            # intermediate_tensors 分支, 而 drafter 的 dummy_run/propose 从不传该参
-            # -> assert 崩 (KV profiling 阶段 Worker died)。MTP 恒整体驻留单个
-            # rank, 恒走 embedding 路径即可; 尾部 is_last_rank 分支在该 rank 为
-            # True, 正常返回 hidden_states。
-            "        if get_pp_group().is_first_rank:\n",
-            "        # SM75 PP+MTP: drafter 整体驻留单个 PP rank, 恒走 embedding 路径\n"
-            "        if True:\n",
-            "        # SM75 PP+MTP: drafter 整体驻留单个 PP rank, 恒走 embedding 路径\n",
-        )],
-    ),
-    (
         # PLE(ngram) 大表 NVMe mmap 需要 PP>1 (8 卡 2080Ti 只能 PP4×TP2 用满)。
         # 上游 Qwen4ExpForConditionalGenerationConfig.verify_and_update_config 对
         # "有 ple_layer_ids 且 PP>1" 一律抛 NotImplementedError(理由: 非首 PP rank
