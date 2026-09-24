@@ -13,6 +13,8 @@
 # "是否需重新 overlay" 判定: 拉取后的 HEAD 与镜像构建时的源 commit
 # (/opt/vllm-turing/image-source-revision) 一致 -> 镜像已最新, 跳过 overlay(秒起);
 # 不一致 -> 跑 fast_compile.sh 重新 overlay(.py 秒级, .so 仅 .cu 变化才重编)。
+# 判定只看 commit, 忽略工作区 dirty/untracked (build.sh 去 digest 等约定性本地
+# 改动不再触发重打 overlay)。
 #
 # 安全: 上游 vLLM 大版本变化(仓库 UPSTREAM_VERSION 与已装 vllm 主版本不符)时只打印
 #       提醒、不强行覆盖 site-packages(锚点注入会因上游改动失败/错位)。
@@ -130,16 +132,17 @@ if [[ -n "$installed_mm" && -n "$upstream_mm" && "$installed_mm" != "$upstream_m
 fi
 
 # --- 4) 是否需要重新 overlay ---
-# 一致且无本地改动 -> 镜像 overlay 已最新, 跳过(秒起)。
-# 否则(新 commit / 本地未提交改动 / 离线取不到 rev) -> 重新 overlay。
-# 含"本地改动"判定: 挂载模式下本地编辑了 overlay 文件(未提交)也能在启动时被应用。
+# 只看 commit 判定: HEAD == 镜像构建源 -> 镜像 overlay 已最新, 跳过(秒起)。
+# 忽略工作区 dirty / untracked (如 build.sh 去 digest 的约定性本地改动、临时
+# 脚本): flashqla .cu 与 overlay .py 均为 tracked 文件, HEAD 相同即内容与镜像
+# 构建时一致, .so hash 门控也不会重编 —— 无需重新 overlay。
+# 离线取不到 HEAD/镜像 rev 时仍走 fast_compile (失败则沿用镜像 overlay, 不阻断)。
 cur_rev=$(git -C "$WORK" rev-parse HEAD 2>/dev/null || echo "")
 img_rev=$(cat "$IMAGE_REV_FILE" 2>/dev/null || echo "")
-dirty=$(git -C "$WORK" status --porcelain 2>/dev/null || true)
-if [[ -n "$cur_rev" && "$cur_rev" == "$img_rev" && -z "$dirty" ]]; then
-  log "仓库 HEAD($cur_rev) 与镜像构建源一致且无本地改动, overlay 已最新, 跳过重新 overlay。"
+if [[ -n "$cur_rev" && "$cur_rev" == "$img_rev" ]]; then
+  log "仓库 HEAD($cur_rev) 与镜像构建源一致, overlay 已最新, 跳过重新 overlay。"
 else
-  log "仓库 HEAD(${cur_rev:-未知}) 与镜像构建源(${img_rev:-未知}) 不一致或存在本地改动, 重新 overlay(编译)..."
+  log "仓库 HEAD(${cur_rev:-未知}) 与镜像构建源(${img_rev:-未知}) 不一致, 重新 overlay(编译)..."
   if WORK="$WORK" bash /opt/vllm-turing/fast_compile.sh; then
     log "overlay 已同步到 ${cur_rev:-当前状态}。"
   else
