@@ -98,6 +98,35 @@ def _hf_tie_word_embeddings() -> bool:
     return True
 
 
+_resident_decided = None  # memoize: per-layer 调用会随 w_int8 累积压低 free, 须首调定一次
+
+def _exl3_int8_resident() -> bool:
+    """int8 权重常驻模式: VLLM_EXL3_INT8=1 且本卡显存够 (首调判定并 memoize)。
+
+    EXL3 默认在线解码 (trellis 压缩态常驻, 每 token 现场 decode 全部权重 ->
+    O(总权重) 每 step, 27B TP2 仅 ~1.6 tok/s, 解码占 93% 仅 27 GB/s)。若 TP 切得
+    够细 (27B TP4 -> int8 6.75GB/卡 < 11GB 2080Ti), int8 权重可常驻, 每 step 只跑
+    M=1 GEMM (免解码, ~18x 提速)。72G MoE 装不下 int8 (24GB/卡), 仍须在线解码。
+    判定须 memoize: process_weights_after_loading 逐层调, 随 w_int8 累积 free 下降,
+    每调重判会中途翻转 (部分层常驻部分在线)。首调时 free 最大, 是最准的判定点。
+    """
+    global _resident_decided
+    if _resident_decided is not None:
+        return _resident_decided
+    if os.environ.get("VLLM_EXL3_INT8") != "1":
+        _resident_decided = False
+        return False
+    try:
+        free, _ = torch.cuda.mem_get_info()
+    except Exception:  # noqa: BLE001
+        _resident_decided = False
+        return False
+    # 首调 free 是上界 (之后只降)。阈值取 4GB (27B TP4 首调 free≈7GB 过; 真放不下
+    # 的卡不会留 4GB)。env 是显式开关, 此仅安全网; 真 OOM 用户关 VLLM_EXL3_INT8 退回。
+    _resident_decided = free > 4 * 1024**3
+    return _resident_decided
+
+
 # ---------------------------------------------------------------------------
 # firefly_exl3.cu 懒加载 (镜像 firefly.py 的 _load_cuda_mod)
 # ---------------------------------------------------------------------------
@@ -156,11 +185,16 @@ def _exl3_forward_shards(
         x2d = F.pad(x2d, (0, K - x2d.shape[1]))
     outputs = []
     for s in shards:
-        w_int8 = torch.empty(s["n_shard"], K, dtype=torch.int8, device=dev)
-        mod.exl3_decode_to_int8(
-            s["trellis"], s["suh"], s["svh"], s["c_n"], w_int8,
-            0, s["n_shard"] // 16, s["bits"],
-        )
+        if "w_int8" in s:
+            # int8 常驻: 加载时已解码, 直接 GEMM, 免每 step 在线解码。
+            w_int8 = s["w_int8"]
+        else:
+            # 在线解码 (默认, int8 装不下时; 27B TP2 / 72G MoE)。
+            w_int8 = torch.empty(s["n_shard"], K, dtype=torch.int8, device=dev)
+            mod.exl3_decode_to_int8(
+                s["trellis"], s["suh"], s["svh"], s["c_n"], w_int8,
+                0, s["n_shard"] // 16, s["bits"],
+            )
         outputs.append(int8_prefill_linear(x2d, w_int8, s["c_n"]))
     y = torch.cat(outputs, dim=1) if len(outputs) > 1 else outputs[0]
     return y
@@ -377,6 +411,7 @@ class Exl3LinearMethod(QuantizeMethodBase):
         if mod is None:
             return
         dev = layer.suh.device
+        resident = _exl3_int8_resident()
         for i in range(layer._exl3_n_shards):
             s = layer._exl3_shards[i]
             if s is None:
@@ -394,6 +429,22 @@ class Exl3LinearMethod(QuantizeMethodBase):
             s["suh"] = layer.suh.data[i]
             s["svh"] = layer.svh.data[sum(layer._exl3_out_per_rank[:i]):sum(
                 layer._exl3_out_per_rank[:i + 1])]
+            if resident:
+                # int8 常驻: 加载时复用在线路径的 fused decode->int8 解一次,
+                # forward 免每 step 在线解码 (27B 在线解码占 ~93% step 时间, 仅
+                # 27 GB/s)。27B TP4 int8 ~6.75GB/卡 装得下 -> ~18x 提速。
+                w_int8 = torch.empty(n_shard, K, dtype=torch.int8, device=dev)
+                mod.exl3_decode_to_int8(
+                    s["trellis"], s["suh"], s["svh"], s["c_n"], w_int8,
+                    0, n_shard // 16, s["bits"],
+                )
+                # 异步 kernel 还没读完 trellis 就 pop 会 use-after-free:
+                # torch allocator 立即标记 free, 后续 empty_cache 把显存还给
+                # CUDA 时 kernel 仍在读 -> illegal memory access。
+                torch.cuda.synchronize()
+                s["w_int8"] = w_int8
+                s.pop("trellis", None)  # 释放压缩态 (常驻后不再在线解码)
+            del w_hat
 
     @torch.compiler.disable
     def apply(
@@ -522,12 +573,20 @@ class Exl3EmbeddingMethod(QuantizeMethodBase):
         s["c_n"] = (w_hat.abs().amax(dim=0) / 127.0).float().contiguous()
         s["suh"] = layer.suh.data
         s["svh"] = layer.svh.data
+        if _exl3_int8_resident():
+            # int8 常驻: 加载时解一次, forward 免每 step 在线解码 (lm_head N 大,
+            # 单次解码量比普通层还大, 常驻收益更明显)。
+            w_int8 = torch.empty(n_shard, K, dtype=torch.int8, device=dev)
+            mod.exl3_decode_to_int8(s["trellis"], s["suh"], s["svh"], s["c_n"],
+                                    w_int8, 0, n_shard // 16, s["bits"])
+            # 同 Linear: 异步 kernel 读完 trellis 前不能 pop (use-after-free)
+            torch.cuda.synchronize()
+            s["w_int8"] = w_int8
+            s.pop("trellis", None)
+        del w_hat
 
     @torch.compiler.disable
     def apply(self, layer, x, bias=None):
-        mod = _load_exl3_cuda_mod()
-        if mod is None:
-            raise RuntimeError("firefly_exl3 CUDA kernel 未加载")
         s = layer._exl3_shards[0]
         if s is None:
             raise RuntimeError("EXL3 lm_head 未加载")
@@ -535,9 +594,15 @@ class Exl3EmbeddingMethod(QuantizeMethodBase):
         K = layer._exl3_K
         if x2d.shape[1] != K:
             x2d = F.pad(x2d, (0, K - x2d.shape[1]))
-        w_int8 = torch.empty(s["n_shard"], K, dtype=torch.int8, device=x.device)
-        mod.exl3_decode_to_int8(s["trellis"], s["suh"], s["svh"], s["c_n"],
-                                w_int8, 0, s["n_shard"] // 16, s["bits"])
+        if "w_int8" in s:
+            w_int8 = s["w_int8"]  # int8 常驻, 免在线解码
+        else:
+            mod = _load_exl3_cuda_mod()
+            if mod is None:
+                raise RuntimeError("firefly_exl3 CUDA kernel 未加载")
+            w_int8 = torch.empty(s["n_shard"], K, dtype=torch.int8, device=x.device)
+            mod.exl3_decode_to_int8(s["trellis"], s["suh"], s["svh"], s["c_n"],
+                                    w_int8, 0, s["n_shard"] // 16, s["bits"])
         y = _int8_prefill_linear()(x2d, w_int8, s["c_n"])
         if bias is not None:
             y = y + bias.to(y.dtype)

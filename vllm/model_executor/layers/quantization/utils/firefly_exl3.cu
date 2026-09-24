@@ -275,7 +275,28 @@ __device__ __forceinline__ void exl3_had_tile(
   const int n = nb_offset + nb * 8;
   const int row_len = gridDim.x * 128;
 
-  __shared__ uint32_t s_packed[8][8][packed_size / 2];
+  // s_mem 复用: 阶段1/2 当 s_packed (uint32 视图), 行 Hadamard 后 (QUANT) 当量化
+  // 暂存 s_stage。二者不共存 (rr 循环前有 __syncthreads, 阶段1/2 必完成), 用一段
+  // __shared__ uint8 + 类型别名复用 (不新增 smem)。2080Ti (sm75) 每 block 默认
+  // smem 48KB, 取 max(s_packed, s_stage) 与 stile(16KB) 合计 ~32.5KB, 放得下。
+  //
+  // s_packed 布局 (原 3 维 [8][8][packed_size/2] uint32): tile (j,wn) 的 flat
+  // uint32 基址 = j*8*PK_U32_TILE + wn*PK_U32_TILE (PK_U32_TILE=packed_size/2)。
+  //
+  // s_stage 布局: [k_local][n_local] 字节, k 行 stride STAGE_KSTRIDE=132
+  // (=128+4) padding: 否则 flush 读 s_stage[kl*132+nl] 同 warp (kl 快变) 地址差
+  // 132B=33 word, bank=(33*kl)%32=kl%32, 32 lane 32 个不同 bank (无 padding 时
+  // stride 128 -> 全落 bank 0, 32-way 冲突); deposit 写 uint32 [R*33+l],
+  // bank=(R*33+l)%32=(R+l)%32, 同样 conflict-free。
+  constexpr int PK_U32_TILE = packed_size / 2;    // 每 (j,wn) tile 的 uint32 数
+  constexpr int PK_U32_TOTAL = 8 * 8 * PK_U32_TILE;  // s_packed 全部 uint32
+  constexpr int STAGE_KSTRIDE = 132;
+  constexpr int STAGE_BYTES = 128 * STAGE_KSTRIDE;  // s_stage 字节
+  __shared__ uint8_t s_mem[(PK_U32_TOTAL * 4 > STAGE_BYTES) ? (PK_U32_TOTAL * 4)
+                                                            : STAGE_BYTES];
+  uint32_t* s_packed_u32 = reinterpret_cast<uint32_t*>(s_mem);
+  uint8_t* s_stage_u8 = s_mem;
+  uint32_t* s_stage_u32 = reinterpret_cast<uint32_t*>(s_mem);
   __shared__ __half2 stile[128 * 64];
 
   auto tix = [&](int R, int q, int p) {
@@ -288,7 +309,9 @@ __device__ __forceinline__ void exl3_had_tile(
     const int r = u % (8 * j_int4);
     const uint16_t* gp =
         g_packed + ((size_t)((kb * 8 + j) * packed_blocks_n + n)) * packed_size;
-    ((int4*)s_packed[j])[r] = ((const int4*)gp)[r];
+    // s_packed 3 维 [8][8][PK_U32_TILE] -> flat: tile (j,wn=0) 基址 j*8*PK_U32_TILE
+    // (PK_U32_TILE%4==0 保证 int4 16B 对齐)。
+    ((int4*)(s_packed_u32 + j * 8 * PK_U32_TILE))[r] = ((const int4*)gp)[r];
   }
   __syncthreads();
 
@@ -298,7 +321,9 @@ __device__ __forceinline__ void exl3_had_tile(
     const int j = (warp_id / 8) * (8 / (RH_THREADS / 256)) + jj;
     const int wn = warp_id & 7;
     FragB frag[2];
-    dq_dispatch_mul1<K>(s_packed[j][wn], lane_id * 8, frag[0], frag[1]);
+    // s_packed 3 维 -> flat: tile (j,wn) 基址 (j*8+wn)*PK_U32_TILE。
+    dq_dispatch_mul1<K>(s_packed_u32 + (j * 8 + wn) * PK_U32_TILE, lane_id * 8,
+                        frag[0], frag[1]);
 
     const __half2 n0 = __shfl_down_sync(0xFFFFFFFF, frag[0][0], 4, 32);
     const __half2 n1 = __shfl_down_sync(0xFFFFFFFF, frag[0][1], 4, 32);
@@ -393,21 +418,31 @@ __device__ __forceinline__ void exl3_had_tile(
     // h01 = 行 Hadamard 后的 [4l, 4l+1] 两列 (未乘 suh/svh); h23 = [4l+2, 4l+3]
     const int k = kb * 128 + R;
     if constexpr (QUANT) {
-      // 直接量化+转置写 int8: W_hat[k, n] = h * suh[k] * svh[n] -> clamp(W_hat/c_n[n])。
-      // c_n 加载时算好(整列 amax/127), 此处每步只做 decode+量化, 不落 fp16 global。
+      // 量化+转置: W_hat[k, n] = h * suh[k] * svh[n] -> clamp(W_hat/c_n[n])。
+      // c_n 加载时算好(整列 amax/127)。
+      // 关键 (decode 提速): 不能直接 4 个 1 字节全局散写 —— lane l 写 n=4l..4l+3,
+      // 相邻 lane 地址差 4*K 字节, 一个 warp 128 字节打散进 128 个 128B sector
+      // (写放大 ~32x), 实测整 kernel 仅 27 GB/s (2080Ti 峰值 ~548)。改为:
+      // 4 字节打包成 uint32 存 shared [k_local=R][n_local=4l..4l+3]
+      // (word bank = R*32+l mod 32 = l, 冲突-free), 行 Hadamard 循环结束后
+      // 全 block __syncthreads, 再整块 16B int4 合并 flush 到 out_int8[n*K+k]。
       const float suf = __half2float(suh[k]);
       const int n0 = nb * 128 + lane_id * 4;
-      out_int8[(size_t)n0 * Kdim + k] =
-          exl3_quant(__low2float(h01) * suf * __half2float(svh[n0]), c_n[n0]);
-      out_int8[(size_t)(n0 + 1) * Kdim + k] =
-          exl3_quant(__high2float(h01) * suf * __half2float(svh[n0 + 1]),
-                     c_n[n0 + 1]);
-      out_int8[(size_t)(n0 + 2) * Kdim + k] =
-          exl3_quant(__low2float(h23) * suf * __half2float(svh[n0 + 2]),
-                     c_n[n0 + 2]);
-      out_int8[(size_t)(n0 + 3) * Kdim + k] =
-          exl3_quant(__high2float(h23) * suf * __half2float(svh[n0 + 3]),
-                     c_n[n0 + 3]);
+      const uint8_t q0 = (uint8_t)exl3_quant(
+          __low2float(h01) * suf * __half2float(svh[n0]), c_n[n0]);
+      const uint8_t q1 = (uint8_t)exl3_quant(
+          __high2float(h01) * suf * __half2float(svh[n0 + 1]), c_n[n0 + 1]);
+      const uint8_t q2 = (uint8_t)exl3_quant(
+          __low2float(h23) * suf * __half2float(svh[n0 + 2]), c_n[n0 + 2]);
+      const uint8_t q3 = (uint8_t)exl3_quant(
+          __high2float(h23) * suf * __half2float(svh[n0 + 3]), c_n[n0 + 3]);
+      // 打包 4 字节 (n_local=4l..4l+3, 低字节=小 n) 存 [k_local=R][n_local=4l]。
+      // uint32 视图行 stride = STAGE_KSTRIDE/4 = 33; 索引 R*33+l -> 字节偏移
+      // R*132+4l; word bank=(R*33+l) mod 32 = (R*1+l) mod 32, 同 warp (l 快变)
+      // 32 个不同 bank, 冲突-free。
+      const uint32_t w = (uint32_t)q0 | ((uint32_t)q1 << 8) |
+                         ((uint32_t)q2 << 16) | ((uint32_t)q3 << 24);
+      s_stage_u32[R * (STAGE_KSTRIDE / 4) + lane_id] = w;
     } else {
       const __half2 su2 = __half2half2(suh[k]);
       half4 v;
@@ -415,6 +450,24 @@ __device__ __forceinline__ void exl3_had_tile(
       v.y = __hmul2(__hmul2(h23, su2), sv4.y);
       *((half4*)(g_unpacked + (size_t)k * row_len + nb * 128 + lane_id * 4)) =
           v;
+    }
+  }
+  if constexpr (QUANT) {
+    __syncthreads();  // 全部 128 行 deposit 完 (8 warp × 4 行/rr) 才可转置读
+    // 转置 flush: shared [k_local][n_local](stride 132) -> global out_int8[n*K+k]。
+    // 关键: 全局地址 ob + nl*Kdim + kl, Kdim 很大, 要全合并必须"快变维=kl"
+    // (相邻 lane 差 +1 字节)。故 e 低位给 kl: kl=e&127, nl=e>>7。同 warp 32 lane
+    // = 同一 nl 行内 32 个连续 kl -> global 32B 连续; 全 block 一轮 256 连续 e
+    // = 2 个 nl 行各 128B -> 128B/行全合并 (修每权重 4 个 1 字节散写: 各算
+    // 64 位 (size_t)n*K 地址 + 打散 sector, ~32x 写放大, 27 GB/s 真根因)。
+    // shared 读 s_stage[kl*132+nl]: 同 warp 32 个连续字节跨 <=9 word, 无 bank
+    // 冲突。行基址 ob 只算一次 (64 位), 循环内 nl*Kdim 用 32 位 size_t 累加。
+    const size_t ob = (size_t)nb * 128 * Kdim + (size_t)kb * 128;
+    for (int e = t; e < 128 * 128; e += RH_THREADS) {
+      const int kl = e & 127;
+      const int nl = e >> 7;
+      out_int8[ob + (size_t)nl * Kdim + kl] =
+          s_stage_u8[kl * STAGE_KSTRIDE + nl];
     }
   }
 }
