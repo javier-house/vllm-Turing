@@ -549,6 +549,41 @@ INJECTIONS: list[tuple[str, list[tuple[str, str, str]]]] = [
             "            # sm75 overlay: PP 下某 group 的层可能全不在本 worker (MTP",
         )],
     ),
+    (
+        # EXL3 (27B VLM) 视觉塔权重跳过: checkpoint 按 MHA 存 (q_proj/k_proj/v_proj),
+        # 但 vllm Qwen3_VisionTransformer 用 fused qkv 模块 (k_proj 子模块不存在) ->
+        # AutoWeightsLoader 递归进视觉塔后找不到 k_proj 模块, utils.py raise。文本
+        # serving 视觉塔永不前向, 顶层 load_weights 直接过滤 visual.* 权重即可 (视觉
+        # qkv 保持随机 init, 不影响文本)。anchor 取顶层 Qwen3_5ForConditionalGeneration.
+        # load_weights 的 return 行 + 其后 @classmethod get_mamba_state_dtype_from_config
+        # (仅顶层类后跟它), 须含 return 与 @classmethod 间的空行 (否则 count=0)。
+        # 对应 EXL3 侧 get_quant_method 对 visual/vision 前缀返 UnquantizedLinearMethod。
+        "model_executor/models/qwen3_5.py",
+        [(
+            "    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:\n"
+            "        loader = AutoWeightsLoader(self)\n"
+            "        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)\n"
+            "\n"
+            "    @classmethod\n"
+            "    def get_mamba_state_dtype_from_config(\n",
+            "    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:\n"
+            "        # SM75 EXL3: skip visual tower weights (fused qkv name mismatch)\n"
+            "        # 视觉塔 checkpoint 按分开 q/k/v_proj 存, vllm 视觉模块用 fused qkv,\n"
+            "        # 递归 loader 找不到 k_proj 模块会 raise。文本推理不执行视觉塔, 顶层\n"
+            "        # 直接跳过 visual.* 权重 (视觉 qkv 保持随机 init, 不影响文本)。\n"
+            "        if getattr(type(self), \"__name__\", \"\") == \"Qwen3_5ForConditionalGeneration\":\n"
+            "            weights = (\n"
+            "                (n, w) for n, w in weights\n"
+            "                if \"visual\" not in n.split(\".\")\n"
+            "            )\n"
+            "        loader = AutoWeightsLoader(self)\n"
+            "        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)\n"
+            "\n"
+            "    @classmethod\n"
+            "    def get_mamba_state_dtype_from_config(\n",
+            "SM75 EXL3: skip visual tower weights (fused qkv name mismatch)",
+        )],
+    ),
 ]
 
 
