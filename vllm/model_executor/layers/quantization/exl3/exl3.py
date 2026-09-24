@@ -311,6 +311,15 @@ class Exl3LinearMethod(QuantizeMethodBase):
                     for j, s in enumerate(sids):
                         seg = loaded[:, starts[j]:starts[j + 1], :]
                         seg = self._narrow_tp(seg, 0, K_full // 16, K_per_rank // 16)
+                        # 必须也切 dim1 (N): fused-on-disk (tuple shard, GDN in_proj_qkv)
+                        # 的每 shard N 是 full 量, ColumnParallel 按 N TP 切。漏切 dim1
+                        # -> 存的 trellis 保持 full N, kernel grid=n_shard/128 只解前
+                        # n_shard 列 (每 rank 都解 rank0 的列) -> rank1 拿到 rank0 列,
+                        # svh (已正确切) 期望 rank1 列 -> GDN (27B 48/64 层) 输出错 -> 乱码。
+                        # 单 shard 分支 (1.5B QKV 分开存) 两维都切故无此坑。
+                        seg = self._narrow_tp(
+                            seg, 1, out_full[s] // 16, out_per_rank[s] // 16
+                        )
                         self._store_shard_trellis(layer, s, seg)
                 else:
                     s = sids[0]
@@ -336,10 +345,14 @@ class Exl3LinearMethod(QuantizeMethodBase):
                     for i, s in enumerate(sids):
                         starts.append(starts[-1] + out_full[s])
                     for j, s in enumerate(sids):
+                        # seg 是 loaded 的 1D 切片, shape[0]=out_full[s] (fused 全量)。
+                        # 直接对 dim0 narrow (勿 unsqueeze(0): 那会把 batch 维插到
+                        # dim0=1, _narrow_tp 判 shape[0]>per_rank 恒 False 不切 ->
+                        # seg 保持 full, 拷进 per-rank slice 崩。GDN in_proj_qkvz 的
+                        # tuple shard (0,1,2,3) 触发此分支, 1.5B (无 GDN) 走单 shard
+                        # 分支故首测未暴露)。
                         seg = loaded[starts[j]:starts[j + 1]]
-                        seg = self._narrow_tp(
-                            seg.unsqueeze(0), 0, out_full[s], out_per_rank[s]
-                        ).squeeze(0)
+                        seg = self._narrow_tp(seg, 0, out_full[s], out_per_rank[s])
                         o_start = sum(out_per_rank[:s])
                         layer.svh.data[o_start:o_start + out_per_rank[s]].copy_(
                             seg.to(torch.float16)
@@ -583,8 +596,36 @@ class Exl3Config(QuantizationConfig):
         return "exl3" if method == "exl3" else None
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
+        # 视觉塔 (VLM 的 Qwen3_5ForConditionalGeneration.visual.*) 不进 EXL3:
+        # exllamav3 按 MHA 量化 vision (q/k/v 各 [1152,1152]), 但 vllm 视觉头按 GQA
+        # 建层 (num_kv_heads 推断 -> QKV N 非 128 倍数) -> 维度不匹配, EXL3 kernel
+        # 按 128 tile 解码崩。须返真 method (linear.py: get_quant_method 返回假值
+        # 会 raise "All linear layers should support quant method"), 用
+        # UnquantizedLinearMethod 建普通 fp16 .weight (视觉塔 EXL3 张量走
+        # _ignore_unexpected_suffixes 忽略; 文本推理不前向视觉塔, 权重随机无影响)。
+        if "visual" in prefix.split(".") or "vision" in prefix.split("."):
+            from vllm.model_executor.layers.linear import (
+                UnquantizedLinearMethod,
+            )
+
+            return UnquantizedLinearMethod()
         # 惰性 import (避开顶层循环; 此时 vllm 已全加载)
         if isinstance(layer, _linear_base_cls()):
+            # EXL3 按 128x128 Hadamard tile 解码, K/N 须 128 倍数。exllamav3 只对
+            # 128 对齐的层做 EXL3 量化; 小维度层 (如 GDN 的 in_proj_a/b, 各
+            # num_v_heads=48 维, checkpoint 里是 plain fp16 .weight 非 EXL3) 返
+            # UnquantizedLinearMethod 建 fp16 .weight 直接加载。get_quant_method
+            # 调用时只有 input_size/output_size 已设 (linear.py:271-272 先于 284),
+            # 用全维度判断 (per-rank 切分后仍 128 倍数, 本试金石各 dense 层满足)。
+            if (
+                int(getattr(layer, "input_size", 0)) % 128 != 0
+                or int(getattr(layer, "output_size", 0)) % 128 != 0
+            ):
+                from vllm.model_executor.layers.linear import (
+                    UnquantizedLinearMethod,
+                )
+
+                return UnquantizedLinearMethod()
             return Exl3LinearMethod(self)
         try:
             from vllm.model_executor.layers.vocab_parallel_embedding import (
