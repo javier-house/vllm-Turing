@@ -1410,6 +1410,21 @@ class AsyncLLM(EngineClient):
                 attempt,
             )
             self._deep_sleep_respawn_pending = False
+            # The respawned engine's P1 receiver cache is empty, while the
+            # frontend's P0 sender/shadow cache still remembers items as
+            # already cached.  It would then send data=None for a previously
+            # seen image, the fresh P1 misses, and the request fails with a
+            # MultiModalCacheMissError (the engine clears only the one stale
+            # hash and returns an error; the HTTP client is not re-sent).
+            # Clearing the P0 cache after the respawn forces the next request
+            # to re-send the full multi-modal data, repopulating P1 cleanly.
+            # This gate runs in add_request() before process_inputs(), so the
+            # clear is visible to this and every later request.
+            await self.renderer.clear_mm_cache_async()
+            logger.info(
+                "[deep-sleep] cleared frontend multi-modal shadow cache "
+                "(fresh P1 cache after respawn)"
+            )
             return
 
         # All attempts failed (or the total budget ran out).  Deliberately
