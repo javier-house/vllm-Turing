@@ -30,7 +30,6 @@ from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme,
 )
 from vllm.model_executor.parameter import (
-    BasevLLMParameter,
     ChannelQuantScaleParameter,
     ModelWeightParameter,
 )
@@ -72,9 +71,9 @@ class FireflyInt8Scheme(CompressedTensorsScheme):
 
     对齐 compressed_tensors 的 scheme 协议: 实现 CompressedTensorsScheme 的
     全部抽象方法 (get_min_capability / create_weights / apply_weights /
-    process_weights_after_loading)。create_weights 的命名与上游 WNA16 对齐
-    (weight_packed / weight_scale / weight_shape), 但**不做 pack** —— 权重保留
-    非打包 int8 [N,K] 行主序 (与 checkpoint 的 weight_packed 张量一一对应)。
+    process_weights_after_loading)。参数命名与上游 W8A8Int8 对齐 (weight /
+    weight_scale), **不做 pack** —— 权重保留非打包 int8 [N,K] 行主序 (与
+    checkpoint 的 weight 张量一一对应)。
     """
 
     @classmethod
@@ -93,9 +92,9 @@ class FireflyInt8Scheme(CompressedTensorsScheme):
         weight_loader: Callable,
         **kwargs,
     ) -> None:
-        """分配 W8A16 (非打包 int8) 参数。命名/入参与上游 WNA16 对齐, 去掉
-        pack_factor / packed_dim: 权重就是 int8 [output, input] 行主序, 与
-        checkpoint 的 weight_packed 张量 shape 一致 (per-channel scale [output])。
+        """分配非打包 int8 参数 (W8A16/W8A8 权重侧相同)。命名/入参与上游
+        W8A8Int8 对齐: weight [output, input] int8 行主序 + per-channel
+        weight_scale [output, 1] float32。
         """
         output_size_per_partition = sum(output_partition_sizes)
         layer.input_size_per_partition = input_size_per_partition
@@ -117,26 +116,23 @@ class FireflyInt8Scheme(CompressedTensorsScheme):
             ),
         )
 
-        # per-channel scale [N] (checkpoint 的 weight_scale, 可能 [N] 或 [N,1]);
-        # dtype 跟随 params_dtype (load 时 copy_ 成 scale 的 dtype, 对齐 WNA16)。
+        # per-channel scale [N,1] (checkpoint 的 weight_scale); float32 (对齐上游
+        # W8A8Int8 的 channel 分支 scale dtype)。
         weight_scale = ChannelQuantScaleParameter(
             output_dim=0,
             weight_loader=weight_loader,
             data=torch.empty(
                 output_size_per_partition,
                 1,
-                dtype=params_dtype,
+                dtype=torch.float32,
             ),
         )
 
-        # 原始 (打包前) 权重 shape, 仅占位 (对齐 WNA16 的 weight_shape)。
-        weight_shape = BasevLLMParameter(
-            data=torch.empty(2, dtype=torch.int64), weight_loader=weight_loader
-        )
-
-        layer.register_parameter("weight_packed", weight)
+        # 注册名 "weight": int-quantized (int8 非打包) format 的标准键名, W8A16 与
+        # W8A8 权重侧布局相同(区别只在激活侧), checkpoint 键名都是 weight —— 故同一
+        # scheme 通吃两者。不要误用 WNA16(int4 打包)的 weight_packed 键名。
+        layer.register_parameter("weight", weight)
         layer.register_parameter("weight_scale", weight_scale)
-        layer.register_parameter("weight_shape", weight_shape)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """把加载好的 int8 权重 / scale 整理成 firefly int8 GEMM 的入参。
@@ -144,10 +140,10 @@ class FireflyInt8Scheme(CompressedTensorsScheme):
         ff_int8_w_int8 [N,K] 行主序 int8 (w_int8); ff_int8_c_n [N] float32
         (c_n = amax_k/127, 与 firefly.py 的 c_n 约定一致)。w_int8 若已
         contiguous 则直接引用 (不 copy, 省显存); scale 兜底 [N,1]/[N] reshape(-1)
-        转 float32。处理完释放原 weight_packed / weight_scale 参数 (数据由新
-        属性持有, 无重复显存)。
+        转 float32。处理完释放原 weight / weight_scale 参数 (数据由新属性持有,
+        无重复显存)。
         """
-        w = layer.weight_packed.data
+        w = layer.weight.data
         if w.dtype != torch.int8:
             w = w.to(torch.int8)
         # 已是 contiguous 直接引用, 不 copy (省显存)。
@@ -157,7 +153,7 @@ class FireflyInt8Scheme(CompressedTensorsScheme):
         )
         # 释放原占位参数 (数据已转移到 ff_int8_* 属性, 无重复显存)。
         try:
-            del layer.weight_packed
+            del layer.weight
         except Exception:  # noqa: BLE001 - 删参兜底, 不影响正确性
             pass
         try:
