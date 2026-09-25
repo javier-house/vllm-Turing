@@ -534,6 +534,46 @@ INJECTIONS: list[tuple[str, list[tuple[str, str, str]]]] = [
             "SM75 EXL3: skip visual tower weights (fused qkv name mismatch)",
         )],
     ),
+    (
+        # int8 权重 (compressed-tensors int-quantized int8, per-channel) 接
+        # firefly int8 GEMM: 覆盖 W8A16 (无激活量化) 与 W8A8 (动态 per-token int8
+        # 激活, SmoothQuant) —— 权重布局相同, 前向都是 per-token 动态 int8 GEMM。
+        # stock vllm 0.29.0 对 W8A16 在 _get_scheme_from_parts 末尾 raise
+        # NotImplementedError。增量注入 (不整文件覆盖): 在 compressed_tensors.py
+        # **文件末尾** append import + maybe_apply() 调用 —— 模块加载时即
+        # monkey-patch CompressedTensorsConfig.get_scheme, 早于任何 get_scheme
+        # 调用 (每个 Linear 层配置 get_quant_method 时被调)。VLLM_FIREFLY 开启时
+        # 命中的 int8 per-channel 层切到 firefly int8 GEMM, 否则 maybe_apply
+        # 直接 return (no-op, 不碰上游)。maybe_apply 幂等 (防重复 import 二次
+        # patch)。anchor 取文件末尾唯一且稳定的 del 块 (EOF 处)。
+        "model_executor/layers/quantization/compressed_tensors/compressed_tensors.py",
+        [(
+            "        # Discard all placeholders.\n"
+            "        del layer.k_scale\n"
+            "        del layer.v_scale\n"
+            "        del layer.q_scale\n"
+            "        del layer.k_zero_point\n"
+            "        del layer.v_zero_point\n"
+            "        del layer.q_zero_point",
+            "        # Discard all placeholders.\n"
+            "        del layer.k_scale\n"
+            "        del layer.v_scale\n"
+            "        del layer.q_scale\n"
+            "        del layer.k_zero_point\n"
+            "        del layer.v_zero_point\n"
+            "        del layer.q_zero_point\n"
+            "\n"
+            "\n"
+            "# SM75 firefly int8: 模块加载时打 monkey-patch (VLLM_FIREFLY 开启时把\n"
+            "# int8 权重 per-channel 层 (W8A16/W8A8) 切到 firefly int8 GEMM, 否则 no-op)。\n"
+            "from vllm.model_executor.layers.quantization.utils import (\n"
+            "    firefly_int8 as _ff_int8,\n"
+            ")\n"
+            "\n"
+            "_ff_int8.maybe_apply()",
+            "_ff_int8.maybe_apply()",
+        )],
+    ),
 ]
 
 
@@ -583,6 +623,7 @@ def main() -> None:
         "model_executor/layers/quantization/utils/firefly.py",
         "model_executor/layers/quantization/utils/firefly.cu",
         "model_executor/layers/quantization/utils/firefly_exl3.cu",
+        "model_executor/layers/quantization/utils/firefly_int8.py",
         "model_executor/layers/quantization/exl3/__init__.py",
         "model_executor/layers/quantization/exl3/exl3.py",
         "distributed/device_communicators/firefly_allreduce.py",
