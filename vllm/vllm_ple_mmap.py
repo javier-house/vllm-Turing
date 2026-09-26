@@ -29,6 +29,9 @@ Knobs (env):
   VLLM_PLE_MMAP_CHUNK=2048    每 gather 任务的行数
   VLLM_PLE_MMAP_RANDOM=1      mmap 标 MADV_RANDOM 关内核预读 (默认 1)
   VLLM_PLE_MMAP_PREWARM=0     1=加载时把整表流读一遍填 page cache
+  VLLM_PLE_MMAP_MODE=mem      offload 模式 disk/mem/vram (默认 disk; mem 需 ~95G RAM)
+  VLLM_PLE_MEM_LAZY=1         mem 模式走 lazy 后台填 (秒级 attach, 默认开; 0=旧阻塞)
+  VLLM_PLE_MEM_FILL_WORKERS=16 lazy 后台填表并行片数 (NVMe 多队列, 默认 16)
 """
 
 from __future__ import annotations
@@ -43,6 +46,7 @@ import os
 import re
 import struct
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Iterable
@@ -79,6 +83,102 @@ _ITEMSIZE = {
     "F32": 4,
 }
 
+# ---- lazy-mem 共享表 header (lazy 子模式专用, 见 PLAN-ple-mmap-lazy-mem) ----
+# 表文件前 64KB 当 header, 数据区从 offset _HDR 起。header 里唯一"会跨进程变"的
+# 字段是 shards_done (水位)。owner 用 pwrite 写水位 (脏页落共享 page cache + fsync
+# 回写 tmpfs), 各 rank 用 open()+read() 从同一 page cache 页读必见 (同机共享, 无需
+# 屏障)。水位写成单调 CAS (只增), 对发布线程调度无关。注: 本机 tmpfs 上 ftruncate
+# 后对已有页 pwrite, np.memmap 视图可能读到 stale 页, 故水位走文件读 (实测恒一致)。
+_HDR = 64 << 10  # header 字节数 (64KB); 数据区起点偏移
+_HDR_MAGIC = b"PLELZM01"  # 8 字节魔数, 用于判断表文件是否为 lazy 结构
+_HDR_OFF_ROWS = 8  # int64 rows_total (小端)
+_HDR_OFF_SHARDS = 16  # int64 shards_total (小端)
+_HDR_OFF_DONE = 24  # int64 shards_done (小端) = 水位 (单调递增的连续前缀片数)
+
+
+def _i64(v: int) -> bytes:
+    """int -> 8 字节小端 (写 header 字段用)。"""
+    return struct.pack("<q", int(v))
+
+
+def _i64_from(raw: bytes, off: int) -> int:
+    """读 8 字节小端 int64。"""
+    return struct.unpack("<q", raw[off : off + 8])[0]
+
+
+def _write_header(tbl: str, rows_total: int, shards_total: int, shards_done: int) -> None:
+    """写 lazy-mem 表 header (magic + 三个 int64 字段)。
+
+    用 pwrite 直写文件头 (不 mmap 额外区域), 写完 flush+fsync 让其他进程可见。
+    字段固定偏移 (见 _HDR_OFF_*), 未用字节补 0 (64KB 区前 _HDR 之外无所谓)。
+    """
+    buf = bytearray(_HDR)
+    buf[0 : len(_HDR_MAGIC)] = _HDR_MAGIC
+    buf[_HDR_OFF_ROWS : _HDR_OFF_ROWS + 8] = _i64(rows_total)
+    buf[_HDR_OFF_SHARDS : _HDR_OFF_SHARDS + 8] = _i64(shards_total)
+    buf[_HDR_OFF_DONE : _HDR_OFF_DONE + 8] = _i64(shards_done)
+    fd = os.open(tbl, os.O_RDWR)
+    try:
+        os.pwrite(fd, bytes(buf), 0)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _read_header(tbl: str) -> dict | None:
+    """读 lazy-mem 表 header。
+
+    返回 {"rows_total","shards_total","shards_done"}; 文件不存在/太小/magic 不对
+    → None (调用方据此判"半死表"重填)。读 64KB 即可 (header 全在前 32 字节内)。
+    """
+    try:
+        with open(tbl, "rb") as f:
+            raw = f.read(_HDR)
+    except OSError:
+        return None
+    if len(raw) < 32 or raw[0 : len(_HDR_MAGIC)] != _HDR_MAGIC:
+        return None
+    return {
+        "rows_total": _i64_from(raw, _HDR_OFF_ROWS),
+        "shards_total": _i64_from(raw, _HDR_OFF_SHARDS),
+        "shards_done": _i64_from(raw, _HDR_OFF_DONE),
+    }
+
+
+def _publish_watermark(tbl: str, k: int) -> None:
+    """把水位 shards_done 提升为 k (单调, 只增不回退, 跨进程可见)。
+
+    调用方不止一个线程 (owner 的 fill 发布线程 + fill 收尾), 故做成**单调 CAS**:
+    先 pread 当前水位 cur, 仅当 k > cur 才 pwrite —— 保证水位永不回退, 与发布
+    线程调度无关 (例: fill 很快完成时, 发布线程的收尾 publish 可能带旧值, 不会
+    把已发布的更高水位改回去)。pwrite 写 header 页 → 脏页落共享 page cache; 读方
+    (各 rank / gather) open()+read() 从同一页读必见 (同机共享页缓存, 无需屏障)。
+    """
+    fd = os.open(tbl, os.O_RDWR)
+    try:
+        try:
+            raw = os.pread(fd, 8, _HDR_OFF_DONE)
+            cur = _i64_from(raw, 0) if len(raw) == 8 else -1
+        except OSError:
+            cur = -1
+        if k > cur:
+            os.pwrite(fd, _i64(k), _HDR_OFF_DONE)
+            os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _read_watermark_file(tbl: str) -> int:
+    """文件直读水位 shards_done (open()+read 64KB, tmpfs 页缓存 ~µs 级)。
+
+    这是水位热路径的可靠通路 (见 MmapPleTable._read_watermark): owner pwrite 把
+    水位写进共享 page cache 页, 各 rank 文件读必见。文件不存在/太小/magic 不对 → 0。
+    """
+    hdr = _read_header(tbl)
+    if hdr is None:
+        return 0
+    return max(0, hdr["shards_done"])
+
 
 def _env_flag(name: str, default: bool) -> bool:
     v = os.environ.get(name, "1" if default else "0").strip().lower()
@@ -98,7 +198,9 @@ def mode() -> str:
     - ``disk`` (默认 / 或 ``VLLM_PLE_MMAP=1``): 磁盘 ``np.memmap``, page cache 换页。
       表 ~95G 走 NVMe, 不进显存/常驻 RAM, 适合主机内存有限时。
     - ``mem``: 整表读进 RAM (numpy 连续数组), gather 纯内存无磁盘 I/O; 需 ~95G 主机
-      内存 (二号机 238G 空闲内存装得下), 比 disk 稳 (无换页抖动)。
+      内存 (二号机 238G 空闲内存装得下), 比 disk 稳 (无换页抖动)。默认再走 lazy
+      子模式 (``VLLM_PLE_MEM_LAZY=1``): 启动只建 header+空数据区秒级 attach,
+      owner 后台逐片填, gather 按片水位路由、未填片回退磁盘 (砍掉 ~11 分钟阻塞)。
     - ``vram``: 不 offload, 整表 load 进 GPU (占 ~95G 显存, 多卡 PP 下每卡都持有),
       仅小表或验证时用。
 
@@ -164,6 +266,10 @@ class MmapPleTable:
 
     mem 模式走 /dev/shm 跨 rank 共享 (见下方 __init__ mem 分支): 同表的所有
     worker 进程只占一份物理页。
+
+    lazy-mem 子模式 (mem 且 lazy=True): 启动时只建 header + 空数据区即 attach
+    (秒级), 整表由 owner 的后台线程逐片填; gather 按片水位路由, 未填的片回退
+    磁盘读 (miss 路径数据永远正确)。水位 = header 里跨进程共享的单调前缀片数。
     """
 
     def __init__(
@@ -176,6 +282,7 @@ class MmapPleTable:
         chunk: int = 2048,
         mem: bool = False,
         key: str = "",
+        lazy: bool = True,
     ) -> None:
         if not shards:
             raise ValueError("no PLE shards")
@@ -201,6 +308,14 @@ class MmapPleTable:
         # 拿不到者 = waiter (等 owner 写完 ready 标志后 attach 同一文件)。
         # owner 崩了内核自动放锁 + ready 标志缺失 → waiter 升 owner 重填 (自愈)。
         self.mem: np.ndarray | None = None
+        # lazy-mem 状态: self.lazy=True 时, self._done_flags(每片是否已填) 与
+        # self._fill_stop(fill 完成信号) 供 owner 后台填线程 + gather 水位路由使用;
+        # self._tbl 是 /dev/shm 表文件路径, gather 据此文件读水位 (owner pwrite
+        # 写进共享页缓存, 各 rank 文件读必见, 仅 lazy 用)。
+        self.lazy: bool = False
+        self._tbl: str | None = None
+        self._done_flags: list[bool] | None = None
+        self._fill_stop: threading.Event | None = None
         if mem:
             import hashlib
 
@@ -210,10 +325,12 @@ class MmapPleTable:
             ).hexdigest()[:16]
             tbl = f"/dev/shm/ple_mmap_{h}"
             ready = f"{tbl}.ready"
+            ready_full = f"{tbl}.ready.full"
+            self._tbl = tbl
             # owner 选举: 对表文件 flock 非阻塞排他。拿到 = owner, 且必须终身
             # 持锁 (存到 self, 进程活多久锁多久; 内核在进程死亡时自动释放) ——
-            # waiter 用同法试锁, 锁被占即证明 "owner 活着且已填完" (ready 与锁
-            # 同时成立), owner 崩 → 锁自动放 → 下次启动无 ready → 新 owner 重填。
+            # waiter 用同法试锁, 锁被占即证明 owner 活着。owner 崩 → 锁自动放 →
+            # 下次启动无 ready → 新 owner 重填 (自愈)。
             lock_fd = os.open(tbl, os.O_RDWR | os.O_CREAT, 0o666)
             try:
                 fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -222,98 +339,202 @@ class MmapPleTable:
                 os.close(lock_fd)
                 self._shm_lock_fd = None
             me_owner = self._shm_lock_fd is not None
-            # 热启动复用: 上次 owner 填好的表还在 /dev/shm (ready 存在 + 大小
-            # 匹配), 直接 attach, 跳过 ~95G 重填 (重启秒级)。表内容只由
-            # key(模型路径)+形状决定, 同一 key 内容必一致。
-            reuse = (
-                os.path.exists(ready)
-                and os.path.getsize(tbl) == self.rows_total * self.row_bytes
-            )
-            if me_owner and not reuse:
-                # owner: 填表。ftruncate 到准确大小后按片拷入, 最后 fsync +
-                # 写 ready 标志 (waiter 看到 ready 才 attach)。
-                logger.info(
-                    "PLE mmap(mem): 本进程为 owner, 整表写入共享表 %s (%.1f GiB)...",
-                    tbl,
-                    self.rows_total * self.row_bytes / 2**30,
+
+            if not lazy:
+                # ---- 旧 mem 路径 (VLLM_PLE_MEM_LAZY=0 保险丝): 阻塞填完再 attach。
+                # 热启动复用: 上次 owner 填好的表还在 /dev/shm (ready 存在 + 大小
+                # 匹配), 直接 attach, 跳过 ~95G 重填 (重启秒级)。表内容只由
+                # key(模型路径)+形状决定, 同一 key 内容必一致。
+                reuse = (
+                    os.path.exists(ready)
+                    and os.path.getsize(tbl) == self.rows_total * self.row_bytes
                 )
-                try:
-                    if os.path.exists(ready):
-                        os.unlink(ready)
-                except OSError:
-                    pass
-                fd = os.open(tbl, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o666)
-                os.ftruncate(fd, self.rows_total * self.row_bytes)
-                buf = np.memmap(tbl, dtype=np.uint8, mode="r+",
-                                shape=(self.rows_total, self.row_bytes))
-                for idx in range(max_idx + 1):
-                    mm = self.mm[idx]
-                    if mm is None:
-                        continue
-                    n = mm.shape[0]
-                    start = idx * self.shard_size
-                    buf[start : start + n] = np.asarray(mm)
-                buf.flush()
-                with open(ready, "w") as f:
-                    f.write(str(self.rows_total))
-                    f.flush()
-                    os.fsync(f.fileno())
-                del buf
-                self.mem = np.memmap(tbl, dtype=np.uint8, mode="r",
-                                     shape=(self.rows_total, self.row_bytes))
-            elif me_owner:
-                # owner 但表已就绪 (热启动): 直接 attach, 不重填。
-                self.mem = np.memmap(tbl, dtype=np.uint8, mode="r",
-                                     shape=(self.rows_total, self.row_bytes))
-                logger.info(
-                    "PLE mmap(mem): 本进程为 owner, 复用已有共享表 %s (%.1f GiB)",
-                    tbl,
-                    self.rows_total * self.row_bytes / 2**30,
-                )
+                if me_owner and not reuse:
+                    # owner: 填表。ftruncate 到准确大小后按片拷入, 最后 fsync +
+                    # 写 ready 标志 (waiter 看到 ready 才 attach)。
+                    logger.info(
+                        "PLE mmap(mem): 本进程为 owner, 整表写入共享表 %s (%.1f GiB)...",
+                        tbl,
+                        self.rows_total * self.row_bytes / 2**30,
+                    )
+                    try:
+                        if os.path.exists(ready):
+                            os.unlink(ready)
+                    except OSError:
+                        pass
+                    fd = os.open(tbl, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o666)
+                    os.ftruncate(fd, self.rows_total * self.row_bytes)
+                    buf = np.memmap(tbl, dtype=np.uint8, mode="r+",
+                                    shape=(self.rows_total, self.row_bytes))
+                    for idx in range(max_idx + 1):
+                        mm = self.mm[idx]
+                        if mm is None:
+                            continue
+                        n = mm.shape[0]
+                        start = idx * self.shard_size
+                        buf[start : start + n] = np.asarray(mm)
+                    buf.flush()
+                    with open(ready, "w") as f:
+                        f.write(str(self.rows_total))
+                        f.flush()
+                        os.fsync(f.fileno())
+                    del buf
+                    self.mem = np.memmap(tbl, dtype=np.uint8, mode="r",
+                                         shape=(self.rows_total, self.row_bytes))
+                elif me_owner:
+                    # owner 但表已就绪 (热启动): 直接 attach, 不重填。
+                    self.mem = np.memmap(tbl, dtype=np.uint8, mode="r",
+                                         shape=(self.rows_total, self.row_bytes))
+                    logger.info(
+                        "PLE mmap(mem): 本进程为 owner, 复用已有共享表 %s (%.1f GiB)",
+                        tbl,
+                        self.rows_total * self.row_bytes / 2**30,
+                    )
+                else:
+                    # waiter: 等 ready (若热启动表已在, 立刻通过; 否则等 owner 填)。
+                    deadline = time.monotonic() + 1800  # 最多等 30 分钟
+                    while not os.path.exists(ready):
+                        if time.monotonic() > deadline:
+                            raise RuntimeError(
+                                f"PLE mmap(mem): 等共享表 {tbl} ready 超时 "
+                                "(owner 进程可能未运行或已卡住)"
+                            )
+                        time.sleep(2.0)
+                    self.mem = np.memmap(tbl, dtype=np.uint8, mode="r",
+                                         shape=(self.rows_total, self.row_bytes))
+                    logger.info(
+                        "PLE mmap(mem): 本进程为 waiter, attach 共享表 %s (%.1f GiB)",
+                        tbl,
+                        self.rows_total * self.row_bytes / 2**30,
+                    )
+                # 已整表进 RAM (共享), 不再需要磁盘 memmap 视图。
+                self.mm = [None] * (max_idx + 1)
             else:
-                # waiter: 等 ready (若热启动表已在, 立刻通过; 否则等 owner 填)。
-                deadline = time.monotonic() + 1800  # 最多等 30 分钟
-                while not os.path.exists(ready):
-                    if time.monotonic() > deadline:
-                        raise RuntimeError(
-                            f"PLE mmap(mem): 等共享表 {tbl} ready 超时 "
-                            "(owner 进程可能未运行或已卡住)"
-                        )
-                    time.sleep(2.0)
-                self.mem = np.memmap(tbl, dtype=np.uint8, mode="r",
-                                     shape=(self.rows_total, self.row_bytes))
-                logger.info(
-                    "PLE mmap(mem): 本进程为 waiter, attach 共享表 %s (%.1f GiB)",
-                    tbl,
-                    self.rows_total * self.row_bytes / 2**30,
+                # ---- lazy-mem 路径: 秒级 attach + 后台按片填, gather 按水位路由。
+                total_size = _HDR + self.rows_total * self.row_bytes
+                n_shards = max_idx + 1
+                self.lazy = True
+                self._fill_stop = threading.Event()
+                self._shards_total = n_shards
+                # 水位读取走 _read_watermark() 的文件读通路 (open+read header 页),
+                # 不在此建任何视图 —— 文件读跨进程恒一致 (owner pwrite → 共享页缓存)。
+                # 热启动复用: 表文件在 + 大小匹配 + header magic 对 + 水位全满 →
+                # 直接 attach, 不重填、不起 fill 线程 (重启秒级)。
+                hdr = _read_header(tbl)
+                reuse = (
+                    hdr is not None
+                    and hdr["rows_total"] == self.rows_total
+                    and hdr["shards_total"] == n_shards
+                    and hdr["shards_done"] == n_shards
+                    and os.path.getsize(tbl) == total_size
                 )
-            # 已整表进 RAM (共享), 不再需要磁盘 memmap 视图。
-            self.mm = [None] * (max_idx + 1)
+                if me_owner and not reuse:
+                    # owner-lazy: 建结构 (ftruncate + header + 空数据区), 立即写
+                    # .ready (语义改: "结构就绪可 attach", 不等填表), 起后台填线程,
+                    # __init__ 秒级返回不阻塞。
+                    logger.info(
+                        "PLE mmap(lazy-mem): 本进程为 owner, 建共享表 %s (%.1f GiB), "
+                        "后台填表 (启动不阻塞)...",
+                        tbl,
+                        total_size / 2**30,
+                    )
+                    try:
+                        if os.path.exists(ready):
+                            os.unlink(ready)
+                        if os.path.exists(ready_full):
+                            os.unlink(ready_full)
+                    except OSError:
+                        pass
+                    fd = os.open(tbl, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o666)
+                    os.ftruncate(fd, total_size)
+                    # header: magic/rows_total/shards_total/shards_done=0 (数据区从
+                    # offset _HDR 起, 此处数据区先留空, 由 fill 线程逐片填)。
+                    _write_header(tbl, self.rows_total, n_shards, 0)
+                    os.close(fd)
+                    # 结构就绪 → 写 .ready, waiter 据此 attach (不必等填表)。水位
+                    # 读取由 _read_watermark() 走文件读, 无需在此建任何视图。
+                    with open(ready, "w") as f:
+                        f.write(str(self.rows_total))
+                        f.flush()
+                        os.fsync(f.fileno())
+                    # 数据区视图 (offset=_HDR 起, 行布局与全局行号一致, 可写)。
+                    self.mem = np.memmap(
+                        tbl, dtype=np.uint8, mode="r+",
+                        offset=_HDR, shape=(self.rows_total, self.row_bytes),
+                    )
+                    # 每片完成标志 (线程间共享, bool 赋值原子); 启动后台填表线程。
+                    self._done_flags = [False] * n_shards
+                    self._start_fill(tbl)
+                elif me_owner:
+                    # owner 但表已全满 (热启动): 直接 attach, 不重填、不起填线程。
+                    self.mem = np.memmap(
+                        tbl, dtype=np.uint8, mode="r",
+                        offset=_HDR, shape=(self.rows_total, self.row_bytes),
+                    )
+                    self._done_flags = [True] * n_shards
+                    logger.info(
+                        "PLE mmap(lazy-mem): 本进程为 owner, 复用已有全满共享表 %s "
+                        "(%.1f GiB)",
+                        tbl,
+                        total_size / 2**30,
+                    )
+                else:
+                    # waiter-lazy: 等 .ready (owner 秒写, 故秒过), attach 数据区。
+                    # 不读水位、不起 fill 线程; 保留 self.mm 磁盘视图供 gather
+                    # miss 回退 (水位未到的片走磁盘读, 数据永远正确)。
+                    deadline = time.monotonic() + 1800  # 最多等 30 分钟
+                    while not os.path.exists(ready):
+                        if time.monotonic() > deadline:
+                            raise RuntimeError(
+                                f"PLE mmap(lazy-mem): 等共享表 {tbl} ready 超时 "
+                                "(owner 进程可能未运行或已卡住)"
+                            )
+                        time.sleep(2.0)
+                    self.mem = np.memmap(
+                        tbl, dtype=np.uint8, mode="r",
+                        offset=_HDR, shape=(self.rows_total, self.row_bytes),
+                    )
+                    logger.info(
+                        "PLE mmap(lazy-mem): 本进程为 waiter, attach 共享表 %s "
+                        "(%.1f GiB, 未填片走磁盘回退)",
+                        tbl,
+                        total_size / 2**30,
+                    )
+                # lazy 下全程保留磁盘 memmap 视图: fill 线程读源 + gather miss 回退。
+                # (128 个 np.memmap 对象只是元数据, 无 RAM 成本, page cache 归内核管。)
 
     def gather(self, ids: np.ndarray) -> np.ndarray:
-        """ids: int64 [N] 全局行号 -> uint8 [N, row_bytes] (新数组)。"""
+        """ids: int64 [N] 全局行号 -> uint8 [N, row_bytes] (新数组)。
+
+        三种路由:
+          - lazy-mem (self.lazy): 按片水位路由 —— 已填片 (si<k) 走内存 self.mem,
+            未填片 (si>=k) 走磁盘 self.mm miss 回退。两来源写同一 out 的不同区段,
+            数据永远正确 (磁盘分片只读不可变, 水位只影响"从哪读"不影响内容)。
+          - 非 lazy mem (self.mem 非 None 且非 lazy): 整表连续数组单次花式索引。
+          - disk: 按片分组对磁盘 memmap 花式索引 (page cache 换页)。
+        """
         ids = np.ascontiguousarray(ids, dtype=np.int64).reshape(-1)
         if ids.size == 0:
             return np.empty((0, self.row_bytes), dtype=np.uint8)
-        # mem 模式: 整表一个连续数组, 去重后单次花式索引 (内存随机访问, 无 I/O)。
-        if self.mem is not None:
-            uniq, inverse = np.unique(ids, return_inverse=True)
-            if uniq[0] < 0 or uniq[-1] >= self.rows_total:
-                raise IndexError(
-                    f"PLE row id out of range: [{uniq[0]}, {uniq[-1]}] "
-                    f"for {self.rows_total} rows"
-                )
-            return self.mem[uniq][inverse]
         # 去重 + 排序: 重复 ngram 常见, 且排序行在片内局部性更好。
         uniq, inverse = np.unique(ids, return_inverse=True)
-        if uniq[0] < 0 or uniq[-1] >= self.shard_size * len(self.mm):
+        if uniq[0] < 0 or uniq[-1] >= self.rows_total:
             raise IndexError(
                 f"PLE row id out of range: [{uniq[0]}, {uniq[-1]}] "
                 f"for {self.rows_total} rows"
             )
+        # 非 lazy mem: 整表一个连续数组, 单次花式索引 (内存随机访问, 无 I/O)。
+        if self.mem is not None and not self.lazy:
+            return self.mem[uniq][inverse]
+
         shard = uniq // self.shard_size
         local = uniq - shard * self.shard_size
         out = np.empty((uniq.size, self.row_bytes), dtype=np.uint8)
+
+        # lazy-mem: 读当前水位 k (一次即可; 调用中途水位上涨只影响性能不影响
+        # 正确性 —— 已填片的数据在发布水位前早已落盘可见)。k==0 时全走磁盘
+        # (等价 disk 模式), 刚启动一片没填也正确。
+        k = self._read_watermark() if self.lazy else -1
 
         bounds = np.flatnonzero(np.diff(shard)) + 1
         starts = np.concatenate(([0], bounds))
@@ -326,11 +547,18 @@ class MmapPleTable:
 
         def run(task: tuple[int, int, int]) -> None:
             si, a, b = task
-            mm = self.mm[si]
-            if mm is None:
-                raise IndexError(f"PLE shard {si} missing")
-            # 对 memmap 做花式索引: page fault 触发 I/O; NumPy 拷贝时放 GIL, 跨线程 overlap。
-            out[a:b] = mm[local[a:b]]
+            if self.lazy and si < k:
+                # 已填片: 内存读。self.mem 数据区从全局行 0 连续排 (行布局不变,
+                # 仅文件内字节偏移 +_HDR, 而 self.mem 已是 offset=_HDR 起的视图),
+                # 故 self.mem[全局行号] 直接对应。
+                out[a:b] = self.mem[uniq[a:b]]
+            else:
+                mm = self.mm[si]
+                if mm is None:
+                    raise IndexError(f"PLE shard {si} missing")
+                # 未填片/disk: 对磁盘 memmap 花式索引; page fault 触发 I/O,
+                # NumPy 拷贝时放 GIL, 跨线程 overlap。
+                out[a:b] = mm[local[a:b]]
 
         if len(tasks) == 1:
             run(tasks[0])
@@ -338,6 +566,107 @@ class MmapPleTable:
             for _ in self.pool.map(run, tasks):
                 pass
         return out[inverse]
+
+    def _read_watermark(self) -> int:
+        """读当前水位 shards_done (gather 每次调用读一次)。
+
+        从表文件 open()+read() header 页 (64KB, tmpfs 页缓存, ~µs 级, 相对 ms 级
+        gather 可忽略) —— 这是跨进程可见的可靠通路: owner pwrite 把水位写进共享
+        page cache 页, 各 rank (含本进程) 都从同一页读必见。
+        注: 不用 np.memmap 视图直读 —— 本机 tmpfs 上 ftruncate 后对已有页做
+        pwrite, mmap 视图可能读到 stale 旧页 (实测 _hdr_view 与文件读不一致),
+        而 open()+read() 恒一致; 故水位热路径走文件读, 保证所有 rank 看到同一值。
+        读到 magic 不对 / 文件未就绪 / 负值 → 0 (保守: 全走磁盘回退, 数据仍正确)。
+        """
+        if self._tbl is None:
+            return 0
+        return _read_watermark_file(self._tbl)
+
+    def _start_fill(self, tbl: str) -> None:
+        """起后台填表 (owner-lazy 专用): fill 工作线程池 + 水位发布线程 (均 daemon)。
+
+        主线程 (本 __init__) 立即返回不阻塞。
+          - fill 工作线程各领不同片: 读磁盘 ``self.mm[idx]`` -> 写
+            ``self.mem[start:start+cnt]``, 每片写完置 ``done[idx]=True``
+            (bool 赋值原子, 线程安全)。用单独 fill 池 (非 self.pool), 不与在线
+            gather 抢 worker。
+          - 水位发布线程每 100ms 扫 done 找最大连续前缀 k, ``_publish_watermark``
+            单调 CAS 写入 ``header.shards_done`` (pwrite+fsync, 跨进程经共享页缓存
+            可见; 只增不回退, 与线程调度无关)。
+          - 全填完 -> 再发布最终水位 n (权威值, 热启动复用据此判全满), 写
+            ``.ready.full`` 标志, 线程退出, 打一条日志。
+        fill 异常不崩 worker 进程: 打日志 + 水位停住, 未填片后续走磁盘回退 (正确)。
+        """
+        n = self._shards_total
+        fill_workers = max(1, _env_int("VLLM_PLE_MEM_FILL_WORKERS", 16))
+        indices = [i for i in range(n) if self.mm[i] is not None]
+        full_ready = f"{tbl}.ready.full"
+        done = self._done_flags  # [False]*n, fill/发布线程共享
+
+        def _fill_shard(idx: int) -> None:
+            mm = self.mm[idx]
+            if mm is None:
+                done[idx] = True  # 无源片视为完成
+                return
+            cnt = mm.shape[0]
+            start = idx * self.shard_size
+            # 读磁盘片 -> 写共享表对应区段; NumPy 拷贝放 GIL, 多线程 overlap。
+            self.mem[start : start + cnt] = np.asarray(mm)
+            done[idx] = True
+
+        def _publisher(last_pub: list[int]) -> None:
+            # 保守水位: 只发布"0..k-1 全 done"的最大连续前缀 k, 单调递增。
+            while not self._fill_stop.is_set():
+                k = 0
+                while k < n and done[k]:
+                    k += 1
+                if k > last_pub[0]:
+                    last_pub[0] = k
+                    try:
+                        _publish_watermark(tbl, k)
+                    except OSError:
+                        logger.warning("PLE mmap(lazy-mem): 发布水位失败", exc_info=True)
+                time.sleep(0.1)
+            # 收尾: 确保最终水位落盘 (正常应 == n)。
+            try:
+                _publish_watermark(tbl, last_pub[0])
+            except OSError:
+                pass
+
+        def _fill_main() -> None:
+            last_pub = [0]
+            threading.Thread(
+                target=_publisher, args=(last_pub,), daemon=True,
+                name="ple-fill-publisher",
+            ).start()
+            try:
+                with ThreadPoolExecutor(max_workers=fill_workers) as fill_pool:
+                    futs = [fill_pool.submit(_fill_shard, idx) for idx in indices]
+                    for fu in futs:
+                        fu.result()
+                # 全部片已落盘: 发布最终水位 n (权威值, 热启动复用据此判全满)。
+                # 此前发布线程只发 <=n 的保守前缀, 此处 n 单调收尾。
+                try:
+                    _publish_watermark(tbl, n)
+                except OSError:
+                    pass
+                self._fill_stop.set()
+                try:
+                    with open(full_ready, "w") as f:
+                        f.write(str(n))
+                        f.flush()
+                        os.fsync(f.fileno())
+                except OSError:
+                    pass
+                logger.info("PLE mmap(lazy-mem): 填表完成, 水位 %d/%d", n, n)
+            except Exception:
+                logger.warning(
+                    "PLE mmap(lazy-mem): 后台填表异常, 未填片将走磁盘回退",
+                    exc_info=True,
+                )
+                self._fill_stop.set()
+
+        threading.Thread(target=_fill_main, daemon=True, name="ple-fill-main").start()
 
     def prewarm(self) -> None:
         """把每片流读一遍, 让 page cache 能装多少装多少。"""
@@ -604,12 +933,20 @@ def _setup_table(self) -> None:
     row_bytes = cols * _ITEMSIZE[dtype_str]
     ple_mode = mode()
     use_mem = ple_mode == "mem"
+    # lazy-mem: mem 模式默认走 lazy 后台填 (VLLM_PLE_MEM_LAZY=0 回退旧阻塞填)。
+    use_lazy = use_mem and _env_flag("VLLM_PLE_MEM_LAZY", True)
     total_rows = sum(rows for (_p, _o, rows) in shards.values())
     total_gib = total_rows * row_bytes / 2**30
     if use_mem:
-        logger.info(
-            "PLE mmap(mem): 整表读进 RAM (%.1f GiB)...", total_gib
-        )
+        if use_lazy:
+            logger.info(
+                "PLE mmap(lazy-mem): 建共享表 + 后台填 RAM (%.1f GiB, 启动不阻塞)...",
+                total_gib,
+            )
+        else:
+            logger.info(
+                "PLE mmap(mem): 整表读进 RAM (%.1f GiB)...", total_gib
+            )
     # key: 模型路径+层号, 保证换模型/换表自动换共享表文件 (不串表)。
     shm_key = f"{model_path}:layer{layer_idx}"
     table = MmapPleTable(
@@ -621,6 +958,7 @@ def _setup_table(self) -> None:
         chunk=_env_int("VLLM_PLE_MMAP_CHUNK", 2048),
         mem=use_mem,
         key=shm_key,
+        lazy=use_lazy,
     )
     # mem 模式整表已在 RAM, 无需再预热线 page cache; disk 模式才走 page cache。
     if not use_mem and _env_flag("VLLM_PLE_MMAP_PREWARM", False):
@@ -631,15 +969,27 @@ def _setup_table(self) -> None:
         table.prewarm()
     self.ngram_embedding.table = table
     if use_mem:
-        logger.info(
-            "PLE mmap(mem): layer %d, %d 片, %d 行 x %d B (RAM %.1f GiB), dtype %s",
-            layer_idx,
-            len(shards),
-            table.rows_total,
-            row_bytes,
-            table.rows_total * row_bytes / 2**30,
-            dtype_str,
-        )
+        if use_lazy:
+            logger.info(
+                "PLE mmap(lazy-mem): layer %d, %d 片, %d 行 x %d B (RAM %.1f GiB), "
+                "dtype %s, 后台填表中, 启动不阻塞 (未填片 gather 走磁盘回退)",
+                layer_idx,
+                len(shards),
+                table.rows_total,
+                row_bytes,
+                table.rows_total * row_bytes / 2**30,
+                dtype_str,
+            )
+        else:
+            logger.info(
+                "PLE mmap(mem): layer %d, %d 片, %d 行 x %d B (RAM %.1f GiB), dtype %s",
+                layer_idx,
+                len(shards),
+                table.rows_total,
+                row_bytes,
+                table.rows_total * row_bytes / 2**30,
+                dtype_str,
+            )
     else:
         logger.info(
             "PLE mmap(disk): layer %d, %d 片, %d 行 x %d B (磁盘 %.1f GiB), dtype %s, %d 线程",

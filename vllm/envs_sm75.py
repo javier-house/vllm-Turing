@@ -188,6 +188,36 @@ def _ple_mmap_mode() -> str:
     return "vram"
 
 
+def _ple_mem_lazy() -> bool:
+    """VLLM_PLE_MEM_LAZY 归一化: 默认开; '0'/'off' 关。
+
+    开 = mem 模式走 lazy 后台填表: 启动时只建 header + 空数据区即 attach (秒级,
+    不阻塞), 整表由 owner 的后台线程逐片填, gather 按片水位路由、未填片回退磁盘
+    读。关 = 旧行为 (owner 阻塞填完整表再 attach, ~11 分钟在启动关键路径), 作回退
+    保险丝。纯运行时选择, 不改编译图 → pop 出 compile_factors 复用历史编译产物。
+    见 vllm/vllm_ple_mmap.py::MmapPleTable (lazy 分支)。
+    """
+    return os.getenv("VLLM_PLE_MEM_LAZY", "1").strip().lower() not in (
+        "0",
+        "off",
+        "false",
+        "no",
+    )
+
+
+def _ple_mem_fill_workers() -> int:
+    """VLLM_PLE_MEM_FILL_WORKERS 归一化: 默认 16。
+
+    lazy-mem 后台填表的并行片数 (NVMe 多队列, 16 足够跑满; 与权重加载并发 IO 想
+    少抢可降到 4 —— 反正不阻塞启动)。纯运行时, 不改编译图 → pop 出 compile_factors。
+    见 vllm/vllm_ple_mmap.py::MmapPleTable._start_fill。
+    """
+    try:
+        return int(os.environ.get("VLLM_PLE_MEM_FILL_WORKERS", "16"))
+    except ValueError:
+        return 16
+
+
 # SM75 自定义 env → getter。install 时灌进 vllm.envs.environment_variables,
 # 之后 envs.<NAME> 属性访问 / is_set / validate_environ / __dir__ 自动生效。
 EXTENSIONS: dict[str, object] = {
@@ -260,6 +290,15 @@ EXTENSIONS: dict[str, object] = {
     "VLLM_PLE_MMAP_CHUNK": lambda: int(
         os.environ.get("VLLM_PLE_MMAP_CHUNK", "2048")
     ),
+    # PLE mem 模式 lazy 后台填表开关, 默认开(_ple_mem_lazy 归一化)。
+    # 开 = 启动秒级 attach + owner 后台逐片填 + gather 按片水位路由 (未填片回退
+    # 磁盘); 0 = 旧行为 (owner 阻塞填完再 attach)。纯运行时, 不改编译图。
+    # 见 vllm/vllm_ple_mmap.py::MmapPleTable。
+    "VLLM_PLE_MEM_LAZY": _ple_mem_lazy,
+    # PLE lazy-mem 后台填表并行片数 (运行时直读, 默认 16; 同权重加载 IO 抢带宽
+    # 可降到 4, 反正不阻塞启动)。纯运行时, 不改编译图。
+    # 见 vllm/vllm_ple_mmap.py::MmapPleTable._start_fill。
+    "VLLM_PLE_MEM_FILL_WORKERS": _ple_mem_fill_workers,
     # A3(sm75 参考): custom allreduce 在 cuda graph capture 时的图输入策略。
     # auto=full decode 走 registered 快路径, piecewise/prefill 回退 staging
     # buffer(sm75 图私有大 buffer 无法经 CUDA IPC 导出); registered/staging
@@ -324,6 +363,11 @@ def apply() -> None:
             if "VLLM_MONITOR" in factors:
                 factors["VLLM_MONITOR"] = False
             factors.pop("VLLM_TEST_INDEX", None)
+            # PLE lazy-mem 两个 env 纯运行时 (后台填表行为 + 填表线程数), 不改编译
+            # 图; 都是新增 env, 历史编译签名里没有这俩 key, pop 掉才能与之对齐,
+            # 复用既有生产编译产物 (getter 实际仍按 env 原值生效)。
+            factors.pop("VLLM_PLE_MEM_LAZY", None)
+            factors.pop("VLLM_PLE_MEM_FILL_WORKERS", None)
             return factors
 
         _compile_factors_sm75._sm75_wrapped = True  # type: ignore[attr-defined]
