@@ -218,6 +218,29 @@ def _ple_mem_fill_workers() -> int:
         return 16
 
 
+def _ple_host_gather() -> bool:
+    """VLLM_PLE_HOST_GATHER 归一化: 默认开; '0'/'off' 关。
+
+    开 = PLE(ngram) 的 ids D2H + 表 gather 从模型 forward 里挪到
+    ``Qwen4ExpModelState.prepare_inputs`` (forward 之前), forward 只 return 预填
+    buffer 的 view。目的: forward 内不再有 custom op 分裂点 → decode 可走
+    FULL_DECODE_ONLY cudagraph (图内无非法 D2H/H2D), 消灭 PIECEWISE 每 step 在
+    PLE/GDN/QSA eager 段间隙的 GPU 空转 (参考实现同改造 decode 45→80)。
+    关 = 旧行为 (gather 在 forward 内的 custom op 里, 强制 splitting op → 只能
+    PIECEWISE), 作回退保险丝。
+
+    本开关**改变 forward 编译图** (op 在/不在 forward 调用路径) → 正常参与编译
+    hash, 不 pop 出 compile_factors (开/关各用各的编译产物, 不复用)。
+    见 vllm/vllm_ple_mmap.py (host_gather) + install_sm75_overlay.py (model_state 注入)。
+    """
+    return os.getenv("VLLM_PLE_HOST_GATHER", "1").strip().lower() not in (
+        "0",
+        "off",
+        "false",
+        "no",
+    )
+
+
 # SM75 自定义 env → getter。install 时灌进 vllm.envs.environment_variables,
 # 之后 envs.<NAME> 属性访问 / is_set / validate_environ / __dir__ 自动生效。
 EXTENSIONS: dict[str, object] = {
@@ -299,6 +322,13 @@ EXTENSIONS: dict[str, object] = {
     # 可降到 4, 反正不阻塞启动)。纯运行时, 不改编译图。
     # 见 vllm/vllm_ple_mmap.py::MmapPleTable._start_fill。
     "VLLM_PLE_MEM_FILL_WORKERS": _ple_mem_fill_workers,
+    # PLE host-gather 开关, 默认开(_ple_host_gather 归一化)。
+    # 开 = PLE gather 挪进 model_state.prepare_inputs (forward 之前预填常驻 buffer),
+    #   forward 只读 buffer view → 无 forward 内 split 点 → decode 可上
+    #   FULL_DECODE_ONLY cudagraph; 0 = 旧行为 (gather 在 forward 内 custom op,
+    #   必须 PIECEWISE), 作回退保险丝。改变编译图 → 参与编译 hash, 不 pop。
+    # 见 vllm/vllm_ple_mmap.py + install_sm75_overlay.py 的 model_state 注入。
+    "VLLM_PLE_HOST_GATHER": _ple_host_gather,
     # A3(sm75 参考): custom allreduce 在 cuda graph capture 时的图输入策略。
     # auto=full decode 走 registered 快路径, piecewise/prefill 回退 staging
     # buffer(sm75 图私有大 buffer 无法经 CUDA IPC 导出); registered/staging

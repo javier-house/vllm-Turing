@@ -472,6 +472,84 @@ INJECTIONS: list[tuple[str, list[tuple[str, str, str]]]] = [
         )],
     ),
     (
+        # PLE host-gather (P0, PLAN-w4a16-decode-ops): 把 PLE(ngram) 的 ids D2H +
+        # 表 gather 从模型 forward 里挪到 model_state.prepare_inputs (forward 之前,
+        # capture 之外), forward 只 return 预填 buffer 的 view → forward 内无 custom
+        # op 分裂点 → decode 可走 FULL_DECODE_ONLY cudagraph (消灭 PIECEWISE 每 step
+        # 在 eager 段间隙的 GPU 空转; 参考实现同改造 decode 45→80)。三处均为
+        # append-only (anchor 原文保留 + 尾追), 不改上游正文:
+        #   (1) __init__ 尾: 找 host-gather PLE 模块挂到 state (PP>1 时其他 rank
+        #       找不到 → 静默 no-op);
+        #   (2) prepare_inputs: 每步 (eager, capture 外) 预填 buffer;
+        #   (3) prepare_dummy_inputs: profiling/capture 用零 id 预填 (capture 在
+        #       cudagraph_utils 调本函数之后, 故 gather 不被 capture)。
+        # helper 全在 vllm_ple_mmap; 这里只 append 调用行 (增量解耦)。env 关
+        # (VLLM_PLE_HOST_GATHER=0) 时 attach_to_model_state 直接 return, 行为回退。
+        "models/qwen4_exp/nvidia/model_state.py",
+        [
+            (
+                "        self.ple_query_start_loc = torch.zeros(\n"
+                "            self.max_num_reqs + 1,\n"
+                "            dtype=torch.int32,\n"
+                "            device=self.device,\n"
+                "        )\n",
+                "        self.ple_query_start_loc = torch.zeros(\n"
+                "            self.max_num_reqs + 1,\n"
+                "            dtype=torch.int32,\n"
+                "            device=self.device,\n"
+                "        )\n"
+                "        # PLE host-gather: 挂预填钩子 (见 vllm_ple_mmap)。\n"
+                "        import vllm.vllm_ple_mmap as _ple_mmap\n"
+                "\n"
+                "        _ple_mmap.attach_to_model_state(self, model)\n",
+                "_ple_mmap.attach_to_model_state(self, model)",
+            ),
+            (
+                "        model_inputs.update(\n"
+                "            query_start_loc=query_start_loc,\n"
+                "            ngram_context=self._prepare_ngram_context(input_batch, req_states),\n"
+                "        )\n"
+                "        return model_inputs\n",
+                "        ngram_context = self._prepare_ngram_context(input_batch, req_states)\n"
+                "        model_inputs.update(\n"
+                "            query_start_loc=query_start_loc,\n"
+                "            ngram_context=ngram_context,\n"
+                "        )\n"
+                "        # PLE host-gather: forward 之前预填 buffer (eager, capture 外)。\n"
+                "        _hg = getattr(self, \"_ple_hg_layer\", None)\n"
+                "        if _hg is not None:\n"
+                "            _hg.host_gather(input_batch.input_ids, query_start_loc, ngram_context)\n"
+                "        return model_inputs\n",
+                "_ple_hg_layer\", None",
+            ),
+            (
+                "        ngram_context = self.ngram_context[:num_reqs]\n"
+                "        ngram_context.fill_(self.ngram_eos_token_id)\n"
+                "        model_inputs.update(\n"
+                "            query_start_loc=query_start_loc,\n"
+                "            ngram_context=ngram_context,\n"
+                "        )\n"
+                "        return model_inputs\n",
+                "        ngram_context = self.ngram_context[:num_reqs]\n"
+                "        ngram_context.fill_(self.ngram_eos_token_id)\n"
+                "        model_inputs.update(\n"
+                "            query_start_loc=query_start_loc,\n"
+                "            ngram_context=ngram_context,\n"
+                "        )\n"
+                "        # PLE host-gather: capture/profiling 用零 id 预填 buffer。\n"
+                "        _hg = getattr(self, \"_ple_hg_layer\", None)\n"
+                "        if _hg is not None:\n"
+                "            _hg.host_gather(\n"
+                "                self._ple_hg_dummy_ids[:num_tokens],\n"
+                "                query_start_loc,\n"
+                "                ngram_context,\n"
+                "            )\n"
+                "        return model_inputs\n",
+                "_ple_hg_dummy_ids[:num_tokens]",
+            ),
+        ],
+    ),
+    (
         # v0.29.0 混合模型 (GDN + QSA + MTP 投机解码) PP>1 下, 某 KV cache group
         # 的层可能全落在单一 PP rank (MTP 草稿头 stage-local / 单 rank PLE 层)。
         # _project_kv_cache_groups_to_worker 对本 worker 空集的 UniformTypeKVCacheSpecs

@@ -60,7 +60,19 @@ logger = logging.getLogger("vllm.ple_mmap")
 ENV_ENABLE = "VLLM_PLE_MMAP"
 ENV_MODE = "VLLM_PLE_MMAP_MODE"
 ENV_RANDOM = "VLLM_PLE_MMAP_RANDOM"
+ENV_HOST_GATHER = "VLLM_PLE_HOST_GATHER"
 _OP_NAME = "qwen4_exp_ple_mmap_lookup"
+
+
+def host_gather_enabled() -> bool:
+    """host-gather 子模式开关 (VLLM_PLE_HOST_GATHER, 默认开, envs_sm75 同源语义)。
+
+    开 = PLE 的 ids D2H + 表 gather 从模型 forward 里挪进
+    ``Qwen4ExpModelState.prepare_inputs`` (forward 之前预填常驻 buffer), forward
+    只 return buffer view → forward 内无 custom op 分裂点 → decode 可走
+    FULL_DECODE_ONLY cudagraph。仅在 PLE offload (disk/mem) 生效时有意义。
+    """
+    return _env_flag(ENV_HOST_GATHER, True)
 
 # safetensors 字符串 dtype -> torch dtype。BF16/F16 原样透传 (不反量化);
 # FP8 保留 (参考实现逻辑, 非重点)。
@@ -884,6 +896,24 @@ def _ensure_splitting_op() -> None:
 # --------------------------------------------------------------------------- #
 # 补丁
 # --------------------------------------------------------------------------- #
+def _ple_out_dtype(self) -> torch.dtype:
+    """PLE 输出 dtype。
+
+    FP8 表保留原生 fp8 (留给上游 ``_dequantize_embeddings`` 乘 weight_scale);
+    bf16/f16 表改为 model dtype —— sm75 无 bf16 计算, 模型回退 fp16, 若输出保留表
+    原生 bf16 会污染后续 fp16 激活 (model.py 里 hidden + ple -> 类型提升成 bf16 ->
+    GDN in_proj 的 marlin 收 bf16 激活, Turing 拒: "only support FP16 or INT8
+    activation")。sm80+ model=bf16 且表=bf16 → 返回 bf16, 行为不变。
+    """
+    table = self.ngram_embedding.table
+    if table is not None and table.torch_dtype in (
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+    ):
+        return table.torch_dtype
+    return self._ple_mmap_out_dtype
+
+
 def _setup_table(self) -> None:
     """开 mmap 表 (幂等)。"""
     if self.ngram_embedding.table is not None:
@@ -1058,11 +1088,19 @@ def maybe_apply(cls: type) -> None:
             self._ple_mmap_out_dtype = params_dtype
         else:
             self._ple_mmap_out_dtype = torch.bfloat16
+        # host-gather 子模式 (VLLM_PLE_HOST_GATHER, 默认开): gather 挪进
+        # model_state.prepare_inputs (capture 外), forward 只 return 预填 buffer
+        # 的 view。buffer 常驻 (capture 前分配, 地址固定), 尺寸 max_total_tokens。
+        # 仅 PLE offload (disk/mem) + 本层真在本 worker 实例化时有意义。
+        self.prefetch_from_model_state = host_gather_enabled()
+        self._ple_hg_max_tokens = int(max_total_tokens)
+        self._ple_hg_buffer: torch.Tensor | None = None  # load_weights 后分配
         logger.info(
-            "PLE mmap: %s -> 占位 embedding (%d 行 x %d), 表将走 mmap",
+            "PLE mmap: %s -> 占位 embedding (%d 行 x %d), 表将走 mmap (host_gather=%s)",
             prefix,
             self.ngram_embedding.org_vocab_size,
             self.head_dim,
+            self.prefetch_from_model_state,
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -1082,12 +1120,59 @@ def maybe_apply(cls: type) -> None:
                 continue
             rest.append((name, w))
         loaded.update(orig_load_weights(self, rest))
-        # 把本 op 注入当前 config 的 splitting_ops, 让 Dynamo 在本 op 处 split,
-        # 使 CPU gather + H2D 在 cudagraph capture 之外 eager 执行 (避免 capture
-        # 期间非法 D2H 拷贝)。幂等, 早于 profile_run/capture 的 compile。
-        _ensure_splitting_op()
         _setup_table(self)
+        if self.prefetch_from_model_state:
+            # host-gather: 分配常驻预填 buffer (max_total_tokens 行), capture 前
+            # 就存在 → 地址固定, cudagraph replay 读同一地址。forward 直接 return
+            # 它的 view, 不再调 custom op → 无需 splitting op (forward 是纯 GPU
+            # copy, 可整段进 FULL cudagraph)。
+            self._ple_hg_dtype = _ple_out_dtype(self)
+            self._ple_hg_buffer = torch.zeros(
+                (self._ple_hg_max_tokens, self.embedding_dim),
+                dtype=self._ple_hg_dtype,
+                device=torch.device("cuda", torch.cuda.current_device()),
+            )
+            logger.info(
+                "PLE mmap(host-gather): 预填 buffer 常驻 (%d x %d, %s), "
+                "forward 不调 custom op → 无 splitting op, decode 可上 FULL graph",
+                self._ple_hg_max_tokens,
+                self.embedding_dim,
+                self._ple_hg_dtype,
+            )
+        else:
+            # 保险丝路径 (VLLM_PLE_HOST_GATHER=0): gather 仍在 forward 内 custom
+            # op, 注入 splitting op 让 Dynamo 在此 split (CPU gather + H2D 移出
+            # cudagraph capture), 行为等同改造前。幂等, 早于 compile/capture。
+            _ensure_splitting_op()
         return loaded
+
+    def host_gather(
+        self,
+        input_ids: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        ngram_context: torch.Tensor,
+    ) -> None:
+        """在 forward 之前填预填 buffer (由 model_state.prepare_inputs 调用)。
+
+        对齐 Minachist host_gather: 算 ngram_ids → mmap gather → 写常驻 buffer
+        前 n 行。在 forward 之外 (eager, capture 之外) 执行 → 其中的 ids D2H +
+        host np.take + H2D 都不进 cudagraph。H2D 走当前 stream (forward/replay
+        紧接着用同一 stream, 无需 event)。
+        """
+        buf = self._ple_hg_buffer
+        if buf is None:
+            return
+        input_ids = input_ids.reshape(-1)
+        num_tokens = min(input_ids.shape[0], buf.shape[0])
+        if num_tokens == 0:
+            return
+        ngram_ids = self.compute_ngram_ids(
+            input_ids[:num_tokens], query_start_loc, ngram_context
+        )
+        gathered = self.ngram_embedding(ngram_ids)  # [num_tokens, heads, head_dim]
+        flat = gathered.reshape(num_tokens, -1).to(buf.dtype)
+        # 只覆盖前 num_tokens 行 (copy_ 保持 buffer 地址不变, replay 仍读同址)。
+        buf[:num_tokens].copy_(flat, non_blocking=True)
 
     def forward(
         self,
@@ -1095,22 +1180,22 @@ def maybe_apply(cls: type) -> None:
         query_start_loc: torch.Tensor,
         ngram_context: torch.Tensor,
     ) -> torch.Tensor:
+        # host-gather 模式: gather 已在 model_state.prepare_inputs -> host_gather()
+        # 里填好常驻 buffer, forward 只 return 前 num_tokens 行的 view (纯 GPU
+        # 操作, 无 D2H/H2D/自定义 op -> 可被 FULL cudagraph 整段 capture)。
+        if self.prefetch_from_model_state:
+            buf = self._ple_hg_buffer
+            if buf is None:
+                # buffer 未建 (load 尚未完成 / dummy 早期): 零占位保管道通。
+                return torch.zeros(
+                    (input_ids.reshape(-1).shape[0], self.embedding_dim),
+                    dtype=self._ple_mmap_out_dtype,
+                    device=input_ids.device,
+                )
+            return buf[: input_ids.reshape(-1).shape[0]]
         input_ids = input_ids.reshape(-1)
         num_tokens = input_ids.shape[0]
-        # 输出 dtype: FP8 表保留 fp8 (留给上游 _dequantize_embeddings 乘 scale);
-        # bf16/f16 表改为 model dtype —— sm75 无 bf16 计算, 模型回退 fp16, 若输出
-        # 保留表原生 bf16 会污染后续 fp16 激活 (model.py 里 hidden + ple -> 类型提升
-        # 成 bf16 -> GDN in_proj 的 marlin 收 bf16 激活, Turing 拒: "only support FP16
-        # or INT8 activation")。sm80+ model=bf16 且表=bf16, _ple_mmap_out_dtype=bf16,
-        # 行为不变。
-        table = self.ngram_embedding.table
-        if table is not None and table.torch_dtype in (
-            torch.float8_e4m3fn,
-            torch.float8_e5m2,
-        ):
-            out_dtype = table.torch_dtype
-        else:
-            out_dtype = self._ple_mmap_out_dtype
+        out_dtype = _ple_out_dtype(self)
         # gather 是 CPU 活 + pageable H2D, 进不了 CUDA graph; 用图外 custom op
         # 拿 layer 执行 (对齐上游 qwen4_exp_compute_ple_ngram_ids 写法)。
         output = torch.empty(
@@ -1131,8 +1216,39 @@ def maybe_apply(cls: type) -> None:
     cls.__init__ = __init__
     cls.load_weights = load_weights
     cls.forward = forward
+    cls.host_gather = host_gather
     cls._ple_mmap_patched = True
     logger.info("PLE mmap patch applied to %s.%s", cls.__module__, cls.__name__)
+
+
+def attach_to_model_state(state, model) -> None:
+    """给 ``Qwen4ExpModelState`` 找 host-gather PLE 模块 (overlay 注入用)。
+
+    由注入到 model_state.py 的一行在 ``Qwen4ExpModelState.__init__`` 尾调用。
+    扫模型找 prefetch_from_model_state 的 PLE 模块 (本模型仅 1 个 PLE 层,
+    ple_layer_ids=[2], 且 PP>1 时只存在于 PP rank 0 —— 其他 rank 找不到, 静默
+    no-op, 与 Minachist decode-02 行为一致), 找到则:
+      * ``state._ple_hg_layer`` = 该模块 (prepare_inputs / prepare_dummy_inputs
+        每步调它的 host_gather 在 capture 外预填 buffer);
+      * ``state._ple_hg_dummy_ids`` = max_num_tokens 个 0 id (profiling/capture
+        时 prepare_dummy_inputs 只有 token 数没有 token, 填 0 行号即可)。
+    """
+    if not host_gather_enabled():
+        return
+    for _, module in model.named_modules():
+        if (
+            getattr(module, "prefetch_from_model_state", False)
+            and hasattr(module, "host_gather")
+        ):
+            state._ple_hg_layer = module
+            state._ple_hg_dummy_ids = torch.zeros(
+                state.max_num_tokens, dtype=torch.int32, device=state.device
+            )
+            logger.info(
+                "PLE mmap(host-gather): model_state 钩子已挂载 layer=%s",
+                getattr(module, "layer_name", "?"),
+            )
+            return
 
 
 __all__ = ["maybe_apply", "enabled"]
