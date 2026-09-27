@@ -241,6 +241,24 @@ def _ple_host_gather() -> bool:
     )
 
 
+def _firefly_hc() -> bool:
+    """VLLM_FIREFLY_HC 归一化: 默认关; '1'/'on'/'true'/'yes' 开。
+
+    开 = qwen4_exp HyperConnection 三投影 (down+inject merged / down / up) 在单流
+    decode(M==1) 走融合标量 GEMV triton kernel (sm75, 不用 tl.dot), 砍 cuBLAS skinny
+    GEMM 的 launch/同步固定成本 (Minachist decode-04 hc-fused-int8 同思路)。prefill /
+    batch>1 / 非 sm75 / 非 fp16 回退原 cuBLAS。吃 fp16 HC 权重 (vllm_hc_dequant 已
+    dequant), 数值与 cuBLAS 同 fp32 累加, 非逐 bit。关 = 完全不改 (上游原路)。
+    改变 decode 图内 HC 算子 → 正常参与编译 hash, 不 pop。见 vllm_firefly_hc.py。
+    """
+    return os.getenv("VLLM_FIREFLY_HC", "").strip().lower() in (
+        "1",
+        "on",
+        "true",
+        "yes",
+    )
+
+
 # SM75 自定义 env → getter。install 时灌进 vllm.envs.environment_variables,
 # 之后 envs.<NAME> 属性访问 / is_set / validate_environ / __dir__ 自动生效。
 EXTENSIONS: dict[str, object] = {
@@ -329,6 +347,10 @@ EXTENSIONS: dict[str, object] = {
     #   必须 PIECEWISE), 作回退保险丝。改变编译图 → 参与编译 hash, 不 pop。
     # 见 vllm/vllm_ple_mmap.py + install_sm75_overlay.py 的 model_state 注入。
     "VLLM_PLE_HOST_GATHER": _ple_host_gather,
+    # firefly HC decode 标量 GEMV 开关, 默认关(_firefly_hc 归一化)。
+    # 开 = HC 三投影单流 decode 走融合标量 GEMV(sm75, 不用 tl.dot); 改 decode 图内
+    # 算子 → 参与编译 hash, 不 pop。见 vllm_firefly_hc.py。
+    "VLLM_FIREFLY_HC": _firefly_hc,
     # A3(sm75 参考): custom allreduce 在 cuda graph capture 时的图输入策略。
     # auto=full decode 走 registered 快路径, piecewise/prefill 回退 staging
     # buffer(sm75 图私有大 buffer 无法经 CUDA IPC 导出); registered/staging

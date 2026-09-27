@@ -719,6 +719,7 @@ def main() -> None:
         "vllm_ple_mmap.py",
         "vllm_mtp_stage_local.py",
         "vllm_hc_dequant.py",
+        "vllm_firefly_hc.py",
     ]
     for relative in files:
         source = source_root / relative
@@ -816,6 +817,23 @@ def main() -> None:
         hc_text = model_file.read_text()
         if "vllm.vllm_hc_dequant.maybe_apply" not in hc_text:
             model_file.write_text(hc_text + hc_hook)
+
+    # firefly HC decode 标量 GEMV: 同 model.py 末尾再 append 一行, 给 Qwen4ExpModel
+    # 的 __init__ 包一层, 实例化后遍历 named_modules 把 HC 三投影的 _gemm_impl 换成
+    # SM75 标量 GEMV custom op (单流 decode 命中, prefill/batch>1/非 sm75 回退原
+    # cuBLAS)。与上面 hc_dequant 链式共存 (那个包 load_weights、这个包 __init__, 不同
+    # 阶段)。env VLLM_FIREFLY_HC 默认关 → maybe_apply 内直接 no-op, 上游原路。见
+    # vllm_firefly_hc.py。
+    model_file2 = package_root / "models/qwen4_exp/nvidia/model.py"
+    if model_file2.is_file():
+        fhc_hook = (
+            "\n# vllm-turing overlay: firefly HC decode 标量 GEMV (idempotent).\n"
+            "import vllm.vllm_firefly_hc\n"
+            "vllm.vllm_firefly_hc.maybe_apply(Qwen4ExpModel)\n"
+        )
+        fhc_text = model_file2.read_text()
+        if "vllm.vllm_firefly_hc.maybe_apply" not in fhc_text:
+            model_file2.write_text(fhc_text + fhc_hook)
 
     third_party_source = source_root / "third_party/flash_qla_sm75"
     third_party_destination = package_root / "third_party/flash_qla_sm75"
