@@ -31,14 +31,17 @@ INSTALL_IGNORED = {
 
 
 def _firefly_mode() -> str:
-    """VLLM_FIREFLY 归一化: '1'=开(=auto) / '0'=关。
+    """VLLM_FIREFLY 归一化: 默认开。
 
-    未设默认 '0'(不激活); '1' 与 'auto' 等价(都算开); 其余值一律 '0'。
+    未设/空 = 开('1', 默认激活 firefly prefill); '0'/'off'/'false'/'no' = 关
+    (回退全上游 marlin); 其余值 ('1'/'auto'/'on'/'true'/'yes') 都算开。
     开 = int4(AWQ/GPTQ) 走 int8 加速, fp8 走上游 marlin(fp8 加速走
     VLLM_FIREFLY_AR fp8 allreduce, 另见 PLAN-fp8-allreduce)。
     """
     v = os.getenv("VLLM_FIREFLY", "").strip().lower()
-    return "1" if v in ("1", "auto", "on", "true", "yes") else "0"
+    if v in ("0", "off", "false", "no"):
+        return "0"
+    return "1"
 
 
 def _firefly_ar_mode() -> str:
@@ -262,11 +265,11 @@ def _firefly_hc() -> bool:
 # SM75 自定义 env → getter。install 时灌进 vllm.envs.environment_variables,
 # 之后 envs.<NAME> 属性访问 / is_set / validate_environ / __dir__ 自动生效。
 EXTENSIONS: dict[str, object] = {
-    # firefly(SM75) prefill 加速总开关, 默认关(_firefly_mode 归一化):
-    #   未设 / 0 = 关(全走上游 marlin, 默认不激活)。
-    #   1 / auto = 开(两者等价): int4(AWQ/GPTQ, W4A16) 走 int8 加速; fp8 走上游
-    #     marlin(sm75 实测 firefly-fp8 不比 marlin 快, 已移除; fp8 加速改走
-    #     VLLM_FIREFLY_AR fp8 allreduce, 见 PLAN-fp8-allreduce)。
+    # firefly(SM75) prefill 加速总开关, 默认开(_firefly_mode 归一化):
+    #   未设 / 1 / auto = 开(默认激活): int4(AWQ/GPTQ, W4A16) 走 int8 加速;
+    #     fp8 走上游 marlin(sm75 实测 firefly-fp8 不比 marlin 快, 已移除; fp8
+    #     加速改走 VLLM_FIREFLY_AR fp8 allreduce, 见 PLAN-fp8-allreduce)。
+    #   0 = 关(全走上游 marlin)。
     # 大 M 现反量化成 int8 走 CUTLASS(IMMA), 小 M/decode 保持 marlin。见
     # model_executor/layers/quantization/utils/firefly.py。
     "VLLM_FIREFLY": _firefly_mode,
