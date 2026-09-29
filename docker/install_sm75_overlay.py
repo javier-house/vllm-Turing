@@ -176,153 +176,6 @@ INJECTIONS: list[tuple[str, list[tuple[str, str, str]]]] = [
                 "            head_size=self.index_head_dim,\n"
                 "            dtype=vllm_config.model_config.dtype,",
             ),
-            (
-                "        self.compressed_key_cache = QSACompressedKeyCache(\n"
-                "            head_size=self.index_head_dim,\n"
-                "            dtype=torch.bfloat16,",
-                "        self.compressed_key_cache = QSACompressedKeyCache(\n"
-                "            head_size=self.index_head_dim,\n"
-                "            dtype=vllm_config.model_config.dtype,",
-                "self.compressed_key_cache = QSACompressedKeyCache(\n"
-                "            head_size=self.index_head_dim,\n"
-                "            dtype=vllm_config.model_config.dtype,",
-            ),
-            # 移植 v0.30.0 PACKED selection buffer: 加 packed_output_width
-            # property (= output_width + 1, 尾列 valid count) 并让 forward 的
-            # fallback (metadata 缺失 / MTP skip_topk) 按 packed 宽度填充,
-            # 与整文件覆盖版 ops/qsa.py 的 packed 流一致。
-            (
-                "    @property\n"
-                "    def output_width(self) -> int:\n"
-                "        return self.token_topk + self.compress_ratio - 1\n",
-                "    @property\n"
-                "    def output_width(self) -> int:\n"
-                "        return self.token_topk + self.compress_ratio - 1\n"
-                "\n"
-                "    @property\n"
-                "    def packed_output_width(self) -> int:\n"
-                "        # 选区 buffer 宽度 = output_width + 1: 尾列是本行有效条目\n"
-                "        # 数 (expand kernel 写), sparse attention kernel 读它作循环上界。\n"
-                "        return self.output_width + 1\n",
-                "def packed_output_width(self) -> int:",
-            ),
-            (
-                "            result = torch.full(\n"
-                "                (hidden_states.shape[0], self.output_width),\n"
-                "                -1,",
-                "            result = torch.full(\n"
-                "                (hidden_states.shape[0], self.packed_output_width),\n"
-                "                -1,",
-                "                (hidden_states.shape[0], self.packed_output_width),",
-            ),
-            # 移植 #54513/#54873 prefill/decode 路径分离: forward 的 import
-            # 块从旧单 kernel qsa_select_paged_tokens 换成 qsa_indexer.py 的
-            # decode/prefill 双 kernel + expand (packed 尾列版, 与我方
-            # ops/qsa.py 消费者一致)。
-            (
-                "        from .ops.qsa import (\n"
-                "            qsa_compress_groups_with_ratio,\n"
-                "            qsa_select_paged_tokens,\n"
-                "            qsa_store_cache_rows,\n"
-                "        )",
-                "        from .ops.qsa import qsa_compress_groups_with_ratio, qsa_store_cache_rows\n"
-                "        from .ops.qsa_indexer import (\n"
-                "            expand_qsa_block_indices,\n"
-                "            qsa_select_paged_decode,\n"
-                "            qsa_select_paged_prefill,\n"
-                "        )",
-                "from .ops.qsa_indexer import (\n",
-            ),
-            # forward 尾部 selection 分派: 旧 v0.29.0 单 kernel 逐行查
-            # token_to_req/seq_lens/query_positions → #54873 双 kernel:
-            # decode 走 request-major uniform kernel (读预算好的
-            # visible_blocks, 吃 1.32x 提速), prefill 保留原逻辑。
-            # metadata 的 num_decodes/decode_query_len/visible_blocks/
-            # max_query_len/max_seq_len 由整文件覆盖版 qsa_cache.py 的
-            # QSAForwardMetadata 提供 (reorder_batch_threshold=1 保证 decode
-            # 在前, split 只计数不重排)。
-            (
-                "        # Score compressed keys, select blocks, then expand them to token indices.\n"
-                "        return qsa_select_paged_tokens(\n"
-                "            q,\n"
-                "            compressed_key_cache,\n"
-                "            compressed_metadata.block_table,\n"
-                "            compressed_metadata.token_to_req,\n"
-                "            compressed_metadata.logical_positions,\n"
-                "            compressed_metadata.seq_lens,\n"
-                "            self.token_topk,\n"
-                "            self.compress_ratio,\n"
-                "            out,\n"
-                "        )",
-                "        if out is None:\n"
-                "            out = torch.empty(\n"
-                "                num_tokens,\n"
-                "                self.packed_output_width,\n"
-                "                dtype=torch.int32,\n"
-                "                device=q.device,\n"
-                "            )\n"
-                "        elif out.shape != (num_tokens, self.packed_output_width):\n"
-                "            raise ValueError(\"QSA selection output has an invalid shape\")\n"
-                "\n"
-                "        # 打分上界与输出 buffer: visible_blocks 是 builder 预算的\n"
-                "        # 每 query 可见压缩块数 (纯 int 算术, 与 token 顺序无关)。\n"
-                "        num_decode_tokens = compressed_metadata.num_decode_tokens\n"
-                "        decode_query_len = compressed_metadata.decode_query_len\n"
-                "        visible_blocks = compressed_metadata.visible_blocks[:num_tokens]\n"
-                "        block_indices = torch.empty(\n"
-                "            num_tokens,\n"
-                "            self.token_topk // self.compress_ratio,\n"
-                "            dtype=torch.int32,\n"
-                "            device=q.device,\n"
-                "        )\n"
-                "\n"
-                "        # decode 请求占 batch 前部 (reorder 机制保证), 共享统一\n"
-                "        # query 长 → request-major uniform kernel。\n"
-                "        if num_decode_tokens:\n"
-                "            num_decodes = compressed_metadata.num_decodes\n"
-                "            if num_decodes * decode_query_len != num_decode_tokens:\n"
-                "                raise ValueError(\"QSA decode rows must form a uniform request batch\")\n"
-                "            decode_slice = slice(0, num_decode_tokens)\n"
-                "            qsa_select_paged_decode(\n"
-                "                q[decode_slice],\n"
-                "                compressed_key_cache,\n"
-                "                compressed_metadata.block_table[:num_decodes],\n"
-                "                visible_blocks[decode_slice],\n"
-                "                self.token_topk,\n"
-                "                self.compress_ratio,\n"
-                "                decode_query_len,\n"
-                "                block_indices[decode_slice],\n"
-                "            )\n"
-                "\n"
-                "        # prefill 请求跟在 decode 行之后 → 逐 query 打分的\n"
-                "        # prefill kernel (按 max_seq_len 截断 logits 行宽)。\n"
-                "        if num_decode_tokens < num_tokens:\n"
-                "            num_decodes = compressed_metadata.num_decodes\n"
-                "            prefill_slice = slice(num_decode_tokens, num_tokens)\n"
-                "            qsa_select_paged_prefill(\n"
-                "                q[prefill_slice],\n"
-                "                compressed_key_cache,\n"
-                "                compressed_metadata.block_table[num_decodes:],\n"
-                "                compressed_metadata.query_start_loc[num_decodes:],\n"
-                "                visible_blocks[prefill_slice],\n"
-                "                self.token_topk,\n"
-                "                self.compress_ratio,\n"
-                "                compressed_metadata.max_query_len,\n"
-                "                block_indices[prefill_slice],\n"
-                "                compressed_metadata.max_seq_len,\n"
-                "            )\n"
-                "        # 压缩块展开成 token 下标 + 写 packed 尾列 (有效条目数)。\n"
-                "        expand_qsa_block_indices(\n"
-                "            block_indices,\n"
-                "            compressed_metadata.logical_positions[:num_tokens],\n"
-                "            visible_blocks,\n"
-                "            self.compress_ratio,\n"
-                "            self.token_topk,\n"
-                "            out,\n"
-                "        )\n"
-                "        return out",
-                "qsa_select_paged_decode(\n",
-            ),
         ],
     ),
     (
@@ -593,14 +446,14 @@ INJECTIONS: list[tuple[str, list[tuple[str, str, str]]]] = [
                 "_ple_hg_layer\", None",
             ),
             (
-                "        ngram_context = self.ngram_context[:num_reqs]\n"
+                "        ngram_context = self.ngram_context\n"
                 "        ngram_context.fill_(self.ngram_eos_token_id)\n"
                 "        model_inputs.update(\n"
                 "            query_start_loc=query_start_loc,\n"
                 "            ngram_context=ngram_context,\n"
                 "        )\n"
                 "        return model_inputs\n",
-                "        ngram_context = self.ngram_context[:num_reqs]\n"
+                "        ngram_context = self.ngram_context\n"
                 "        ngram_context.fill_(self.ngram_eos_token_id)\n"
                 "        model_inputs.update(\n"
                 "            query_start_loc=query_start_loc,\n"
@@ -721,32 +574,6 @@ INJECTIONS: list[tuple[str, list[tuple[str, str, str]]]] = [
             "\n"
             "_ff_int8.maybe_apply()",
             "_ff_int8.maybe_apply()",
-        )],
-    ),
-    (
-        # QSA #54513/#54873 移植: warmup hook。在 kernel_warmup() 的
-        # enable_jit_warmup 块内加 qwen4_exp_qsa_triton_warmup(worker), 首次
-        # 真实 decode/prefill 前把新 indexer kernel 的全部可达 specialization
-        # 编好 (TritonWarmupTensor, 只编译不 launch)。import 用 sys.modules
-        # 懒取 (qsa 模型未加载时 no-op), 由 enable_jit_warmup (默认 True)
-        # 统一门控, 无需新 env。sm75 若 warmup 太慢/炸再仿 GDN 先例加
-        # VLLM_SKIP_QSA_WARMUP。
-        "model_executor/warmup/kernel_warmup.py",
-        [(
-            "    if worker.vllm_config.kernel_config.enable_jit_warmup:\n"
-            "        kimi_k3_triton_warmup(worker)\n"
-            "        fa4_cutedsl_warmup(worker)",
-            "    if worker.vllm_config.kernel_config.enable_jit_warmup:\n"
-            "        kimi_k3_triton_warmup(worker)\n"
-            "        fa4_cutedsl_warmup(worker)\n"
-            "        # QSA #54513/#54873 移植: 预热新 indexer decode/prefill\n"
-            "        # kernel (懒 import, qsa 模型未加载时 no-op)。\n"
-            "        from vllm.model_executor.warmup.qwen4_exp_qsa_warmup import (\n"
-            "            qwen4_exp_qsa_triton_warmup,\n"
-            "        )\n"
-            "\n"
-            "        qwen4_exp_qsa_triton_warmup(worker)",
-            "qwen4_exp_qsa_triton_warmup(worker)",
         )],
     ),
     (
@@ -1012,20 +839,21 @@ def main() -> None:
     if "quantization.exl3 import Exl3Config" not in quant_text:
         quant_init.write_text(quant_text + exl3_hook)
 
-    # PLE(ngram) 大表 NVMe mmap: 往上游 qwen4_exp ple_layer.py 末尾 append 一行,
-    # 在 Qwen4ExpNGramEmbedding 类定义之后、实例化之前触发 maybe_apply (打 patch)。
-    # 手法与上面 envs hook 一致 (尾部 append + marker 判幂等)。文件不存在 (底座没带
-    # qwen4_exp 模型) 则跳过 —— PLE mmap 只在该模型下有意义, 不影响其余行为。
-    ple_layer_file = package_root / "models/qwen4_exp/nvidia/ple_layer.py"
-    if ple_layer_file.is_file():
+    # PLE(ngram) 大表 NVMe mmap: v0.30 起 Qwen4ExpNGramEmbedding 类从 ple_layer.py
+    # 搬到 ngram_embedding.py (ple_layer.py 仅 import)。往 ngram_embedding.py 末尾
+    # append 一行, 在类定义之后、实例化之前触发 maybe_apply (打 patch)。手法与上面
+    # envs hook 一致 (尾部 append + marker 判幂等)。文件不存在 (底座没带 qwen4_exp
+    # 模型) 则跳过 —— PLE mmap 只在该模型下有意义, 不影响其余行为。
+    ngram_emb_file = package_root / "models/qwen4_exp/nvidia/ngram_embedding.py"
+    if ngram_emb_file.is_file():
         ple_hook = (
             "\n# vllm-turing overlay: PLE 表 NVMe mmap offload (idempotent).\n"
             "import vllm.vllm_ple_mmap\n"
             "vllm.vllm_ple_mmap.maybe_apply(Qwen4ExpNGramEmbedding)\n"
         )
-        ple_text = ple_layer_file.read_text()
-        if "vllm.vllm_ple_mmap.maybe_apply" not in ple_text:
-            ple_layer_file.write_text(ple_text + ple_hook)
+        ngram_emb_text = ngram_emb_file.read_text()
+        if "vllm.vllm_ple_mmap.maybe_apply" not in ngram_emb_text:
+            ngram_emb_file.write_text(ngram_emb_text + ple_hook)
 
     # MTP 草稿头 stage-local: 往上游 qwen4_exp mtp.py 末尾 append 一行, 在
     # Qwen4ExpMultiTokenPredictor 类定义之后、实例化之前触发 maybe_apply (打 patch)。

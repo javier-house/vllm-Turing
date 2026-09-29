@@ -10,8 +10,9 @@ NVMe、靠内核 page cache 换页, 按行 gather —— 正是 llama.cpp 对 GG
 
 做法: ``VLLM_PLE_MMAP=1`` 时 ``maybe_apply(cls)`` 给上游
 ``Qwen4ExpNGramEmbedding`` 打三处 patch:
-  * ``__init__``: 跑原构造, 但把其中的 ``PLEVocabParallelEmbedding`` 临时换成
-    ``_MmapNgramEmbedding`` 占位 (不分配那张大 GPU 张量);
+  * ``__init__``: 跑原构造, 但把其中的表类临时换成 ``_MmapNgramEmbedding`` 占位
+    (不分配那张大 GPU 张量)。v0.30 CPU_OFFLOAD=0 时上游选 ``Qwen4ExpPLEDeviceEmbedding``
+    (ngram_embedding.py:702), 故 swap 目标即该类 (v0.29 曾直接实例化 ``PLEVocabParallelEmbedding``);
   * ``load_weights``: 跳过所有 ``ngram_embedding.shard_N.weight`` (不 copy、不
     进显存, 直接由磁盘 mmap 服务), 其余张量照原逻辑加载, 随后开 mmap 表;
   * ``forward``: 把 "算 ngram_ids + mmap gather + pageable H2D" 包进 custom op
@@ -698,7 +699,7 @@ class MmapPleTable:
 
 
 # --------------------------------------------------------------------------- #
-# 顶替 PLEVocabParallelEmbedding 的占位 (不分配大张量)
+# 顶替 v0.30 表类 Qwen4ExpPLEDeviceEmbedding 的占位 (不分配大张量)
 # --------------------------------------------------------------------------- #
 class _MmapNgramEmbedding(nn.Module):
     """Duck-type 上游 PLE 代码会读到的 ``VocabParallelEmbedding`` 字段。
@@ -707,13 +708,33 @@ class _MmapNgramEmbedding(nn.Module):
     ``_dequantize_embeddings`` 对非 FP8 也不碰 ``weight_scale`` (走 None 分支)。
     """
 
-    def __init__(self, num_embeddings: int, embedding_dim: int) -> None:
+    def __init__(self, num_embeddings: int, embedding_dim: int, **kw) -> None:
+        # v0.30 起上游以 embedding_method / params_dtype / padding_size / prefix /
+        # num_ngram_heads / max_total_tokens / data_parallel_rank 等 kw 调用本占位
+        # (取代旧的 PLEVocabParallelEmbedding 直建路径), 这里全部吞掉 —— 占位不建
+        # 任何真实参数, 真表走 mmap。
         super().__init__()
+        del kw
         self.num_embeddings = int(num_embeddings)
         self.org_vocab_size = int(num_embeddings)
         self.embedding_dim = int(embedding_dim)
         self.table: MmapPleTable | None = None
         self._zeros_dtype = torch.bfloat16
+        # v0.30 NGram.__init__ 尾部会 `weight = self.ngram_embedding.weight` 并
+        # `weight.is_pinned()` 打初始化日志 (ngram_embedding.py:719/727)。给占位一个
+        # 0 元素 CPU 张量满足这两处读取: 不注册为 Parameter (不进参数迭代), 也不
+        # 分配那张大 GPU 张量 (真表由 mmap 服务)。is_pinned() 恒 False。
+        self.weight = torch.empty(0, dtype=torch.float32)
+
+    def dequantize(self, embeddings: torch.Tensor, output_dtype: torch.dtype) -> torch.Tensor:
+        # v0.30 PLELayer._dequantize_embeddings 委托 ngram_embedding.dequantize(emb,
+        # dtype) (ple_layer.py:150)。非 fp8 表透传到目标 dtype (对齐 _ple_out_dtype:
+        # bf16/f16 → model dtype);fp8 表若在 load_weights/_setup_table 挂了全局
+        # weight_scale, 则乘 scale 反量化 (对齐上游 Qwen4ExpPLEFp8EmbeddingMethod)。
+        scale = getattr(self, "weight_scale", None)
+        if scale is not None:
+            return embeddings.to(output_dtype) * scale.to(output_dtype)
+        return embeddings.to(output_dtype)
 
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
         table = self.table
@@ -1037,7 +1058,8 @@ def maybe_apply(cls: type) -> None:
     """``VLLM_PLE_MMAP`` 开时给 ``Qwen4ExpNGramEmbedding`` 打 patch (幂等)。
 
     关 (未设 / 0) 直接 return, 对现有行为零影响。在类定义之后、实例化之前调用
-    (由 install_sm75_overlay.py append 到上游 ple_layer.py 末尾触发)。
+    (由 install_sm75_overlay.py append 到上游 ngram_embedding.py 末尾触发, v0.30
+    起该类从 ple_layer.py 搬到了 ngram_embedding.py)。
     """
     if not enabled():
         return
@@ -1053,18 +1075,21 @@ def maybe_apply(cls: type) -> None:
         embedding_dim,
         ple_dense_layer_id,
         max_total_tokens,
-        max_num_reqs,
-        prefix,
-        layer_name,
+        *,
+        data_parallel_rank=0,
+        prefix="",
         quant_config=None,
         params_dtype=None,
     ) -> None:
-        # 用占位顶替 PLEVocabParallelEmbedding, 跑原构造 (hash buffer/workspace
-        # 照常建), 但不分配那张大 GPU 张量。quant_config=None 让上游不走 FP8
-        # 量化方法 (反正占位不建 FP8 权重参数)。
-        real_cls = mod.PLEVocabParallelEmbedding
-        mod.PLEVocabParallelEmbedding = (
-            lambda n, d, **_kw: _MmapNgramEmbedding(n, d)
+        # 用占位顶替 v0.30 默认表类 Qwen4ExpPLEDeviceEmbedding (CPU_OFFLOAD=0 时
+        # NGram.__init__ 选它, ngram_embedding.py:702), 跑原构造 (hash buffer 照常
+        # 建), 但不分配那张大 GPU 张量。quant_config=None 让上游不走 FP8 量化方法
+        # (反正占位不建 FP8 权重参数, embedding_method 被占位 **kw 吞掉)。
+        # v0.30 CPU_OFFLOAD 默认 1 会选 Qwen4ExpPLEPinnedHostEmbedding (pin 95G RAM),
+        # 那条路 start_*.sh 必须 export VLLM_PLE_CPU_OFFLOAD=0, 否则本 swap 不命中。
+        real_cls = mod.Qwen4ExpPLEDeviceEmbedding
+        mod.Qwen4ExpPLEDeviceEmbedding = (
+            lambda *a, **kw: _MmapNgramEmbedding(a[0], a[1], **kw)
         )
         try:
             orig_init(
@@ -1073,15 +1098,23 @@ def maybe_apply(cls: type) -> None:
                 embedding_dim,
                 ple_dense_layer_id,
                 max_total_tokens,
-                max_num_reqs,
-                prefix,
-                layer_name,
+                data_parallel_rank=data_parallel_rank,
+                prefix=prefix,
                 quant_config=None,
                 params_dtype=params_dtype,
             )
         finally:
-            mod.PLEVocabParallelEmbedding = real_cls
+            mod.Qwen4ExpPLEDeviceEmbedding = real_cls
         self._ple_mmap_prefix = prefix
+        # v0.30 NGram 不再有 self.layer_name, 但 custom-op 保险丝路径
+        # (_qwen4_exp_ple_mmap_lookup 查 no_compile_layers[layer_name]) 需要它。
+        # NGram prefix = "…layers.N.ple.ple_embedding", 去掉尾缀还原成 PLELayer
+        # prefix (= static_forward_context 的 key, 其值是 PLELayer), 与 lookup 取
+        # layer.ple_embedding 的写法吻合。仅保险丝路径 (host_gather 关) 才用到。
+        _suffix = ".ple_embedding"
+        self.layer_name = (
+            prefix[: -len(_suffix)] if prefix.endswith(_suffix) else prefix
+        )
         self._ple_mmap_model_path = _model_path()
         if params_dtype is not None:
             self.ngram_embedding._zeros_dtype = params_dtype
@@ -1176,10 +1209,14 @@ def maybe_apply(cls: type) -> None:
 
     def forward(
         self,
+        hidden_states: torch.Tensor,
         input_ids: torch.Tensor,
         query_start_loc: torch.Tensor,
         ngram_context: torch.Tensor,
     ) -> torch.Tensor:
+        # v0.30 PLELayer.forward 按 4 参调用 self.ple_embedding(hidden_states, ...)
+        # (ple_layer.py:409), 故首参 hidden_states 必须收 (本 patch 用不到, 忽略)。
+        del hidden_states
         # host-gather 模式: gather 已在 model_state.prepare_inputs -> host_gather()
         # 里填好常驻 buffer, forward 只 return 前 num_tokens 行的 view (纯 GPU
         # 操作, 无 D2H/H2D/自定义 op -> 可被 FULL cudagraph 整段 capture)。

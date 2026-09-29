@@ -9,10 +9,12 @@ from typing import ClassVar, cast
 import torch
 from torch import nn
 
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import (
     set_default_quant_scales,
 )
@@ -27,11 +29,6 @@ from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
 )
 from vllm.utils.torch_utils import (
-    LayerNameType,
-    _encode_layer_name,
-    _resolve_layer_name,
-    canonicalize_singleton_dim_strides,
-    direct_register_custom_op,
     kv_cache_dtype_str_to_dtype,
 )
 from vllm.v1.attention.backend import (
@@ -56,8 +53,6 @@ from vllm.v1.kv_cache_interface import (
 from ..common.qsa_cache import QSAForwardMetadata
 from . import model
 from .indexer_qsa import QSAIndexer
-
-from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
@@ -118,7 +113,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         # fp8_e4m3: 先按 bfloat16 过 FlashAttentionImpl.__init__ —— 其内的
         # flash_attn_supports_kv_cache_dtype 门 (flash_attn.py) 在 sm75 对 fp8 直接
         # False→raise (sm75 无 FA3/FA4 fp8 kernel)。但 QSA 不走 FA 的注意力 kernel,
-        # 走自家 Triton kernel (ops/qsa.py, fp8 加载后 .to(bf16) 反量化), 该门是误报。
+        # 走自家 Triton kernel (ops/qsa.py, fp8 加载后位运算解码), 该门是误报。
         # 故用 bfloat16 过构造, 再把真实 dtype 翻回 fp8_e4m3 —— do_kv_cache_update
         # 据此走 reshape_and_cache_flash 的 fp8 量化写入 (unit k/v scale)。
         is_e4m3 = (
@@ -141,7 +136,9 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 "Qwen4Exp QSA does not support decode context parallelism"
             )
         if self.kv_cache_dtype not in ("auto", "bfloat16", "fp8_e4m3"):
-            raise NotImplementedError("Qwen4Exp QSA requires a BF16 or E4M3 main KV cache")
+            raise NotImplementedError(
+                "Qwen4Exp QSA requires a BF16 or E4M3 main KV cache"
+            )
         self.supports_quant_query_input = False
 
     def forward_qsa(
@@ -154,7 +151,8 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         attn_metadata: FlashAttentionMetadata,
         output: torch.Tensor,
         token_to_req: torch.Tensor,
-        use_prefill_config: bool = False,
+        use_prefill_config: bool,
+        output_gate: torch.Tensor,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -177,14 +175,13 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         logical_indices = topk_buffer[:num_tokens]
         token_to_req = token_to_req[:num_tokens]
         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
-        key_cache = canonicalize_singleton_dim_strides(key_cache)
-        value_cache = canonicalize_singleton_dim_strides(value_cache)
         # fp8_e4m3 cache 物理张量是 uint8 (原始 fp8 字节)。不 .view(float8_e4m3fn):
         # 那会让 QSA kernel 看到 fp8e4nv 张量, sm75 的 Triton 连 .to(tl.float32)
         # 的 cast 都在编译期报 "type fp8e4nv not supported in this architecture"。
         # 改为以 uint8 原样进 kernel, kernel 用 _qsa_fp8e4m3fn_bits_to_fp32 纯位运算
-        # 解码 (uint8 软件解码 fp8_e4m3)。BF16/FP16 cache (原路径) 不动。
-        # query 恒为激活 dtype (sm75 回退 f16, 其余 bf16)。
+        # 解码 (uint8 软件解码 fp8_e4m3)。BF16/FP16 cache (原路径) 不动。query 恒为
+        # 激活 dtype (sm75 回退 f16, 其余 bf16)。此 dtype 门与 ops 侧
+        # qsa_sparse_paged_attention 的断言逐元素一致 (契约 C2)。
         if query.dtype not in (torch.bfloat16, torch.float16) or key_cache.dtype != value_cache.dtype:
             raise NotImplementedError("Qwen4Exp QSA requires BF16/FP16 query and matching K/V")
         if key_cache.dtype not in (torch.bfloat16, torch.float16, torch.uint8):
@@ -201,6 +198,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             token_to_req,
             use_prefill_config,
             output[:num_tokens],
+            output_gate=output_gate[:num_tokens],
         )
         return output
 
@@ -233,7 +231,9 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         # 允许 fp8_e4m3: 主 KV 走 fp8 存储, 未校准 (checkpoint 无 k/v_scale) →
         # unit scale + 告警。激活仍是 BF16。
         if cache_config.cache_dtype not in ("auto", "bfloat16", "fp8_e4m3"):
-            raise NotImplementedError("Qwen4Exp QSA requires a BF16 or E4M3 main KV cache")
+            raise NotImplementedError(
+                "Qwen4Exp QSA requires a BF16 or E4M3 main KV cache"
+            )
         if getattr(quant_config, "kv_cache_scheme", None) is not None:
             raise NotImplementedError("Qwen4Exp QSA does not support KV quantization")
         parallel_config = vllm_config.parallel_config
@@ -254,6 +254,11 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         if self.total_num_heads % tp_size:
             raise ValueError("QSA attention heads must be divisible by TP size")
         self.num_heads = self.total_num_heads // tp_size
+        # Decode/verify batches have at most 1 + num_spec query tokens per
+        # request; use_prefill_config (max_query_len > this) steers the
+        # config table. Shorter batches take the decode profile — harmless,
+        # the difference is tile-shape tuning, not correctness.
+        self._max_decode_query_len = 1 + vllm_config.num_speculative_tokens
         self.total_num_kv_heads = int(config.num_key_value_heads)
         if self.total_num_kv_heads >= tp_size:
             if self.total_num_kv_heads % tp_size:
@@ -265,10 +270,6 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
-        # 移植 v0.30.0: decode/verify 批最多 1+num_spec 个 query token/请求,
-        # max_query_len 超过该值才是 prefill 批 → use_prefill_config 走 prefill
-        # 专用 tile 档 (同一 cudagraph 内 max_query_len 恒定, 判据 capture-stable)。
-        self._max_decode_query_len = 1 + vllm_config.num_speculative_tokens
         self.dual_chunk_attention_config = getattr(
             config, "dual_chunk_attention_config", None
         )
@@ -332,10 +333,12 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             self.kv_cache_dtype, model_config
         )
         # fp8_e4m3 时是 uint8 (STR_DTYPE_TO_TORCH_DTYPE["fp8_e4m3"]=uint8, 原始
-        # fp8 字节, forward_qsa 里再 .view(float8_e4m3fn) 读); bf16/auto 时是
-        # bfloat16 (model dtype)。
+        # fp8 字节, kernel 内按字节位运算解码读); bf16/auto 时是 bfloat16
+        # (model dtype)。
         if self.kv_cache_torch_dtype not in (torch.bfloat16, torch.uint8):
-            raise NotImplementedError("Qwen4Exp QSA requires BF16 or E4M3 cache storage")
+            raise NotImplementedError(
+                "Qwen4Exp QSA requires BF16 or E4M3 cache storage"
+            )
         if self.kv_cache_dtype == "fp8_e4m3":
             # 未校准 (checkpoint 无 k_scale/v_scale): 用 set_default_quant_scales
             # 装的 unit scale (1.0)。E4M3 无 rescale, 绝对值 > 448 的 K/V 会饱和;
@@ -372,10 +375,11 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             prefix=f"{prefix}.indexer",
         )
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
-        # 移植 v0.30.0 PACKED selection buffer: 宽度 = output_width + 1,
-        # 尾列由 expand kernel 写每行有效条目数 (sparse attention kernel 读它
-        # 作循环上界), 永不是 token 下标; MTP skip_topk 步复用 step-0 冻结的
-        # 行, count 是列所以与内容保持配对。
+        # PACKED selection buffer: the trailing column holds each row's
+        # valid-entry count (written by the expand kernel) — never a token
+        # index; the sparse attention kernel reads it as its loop bound.
+        # MTP skip_topk steps reuse rows frozen from step 0; the count is
+        # a row column, so compaction/reuse keep it paired with the content.
         self.register_buffer(
             "topk_indices_buffer",
             torch.empty(
@@ -404,14 +408,16 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
         )
 
+    @eager_break_during_capture
     def _run_qsa(
         self,
-        hidden_states: torch.Tensor,
+        projected_qk: torch.Tensor,
         positions: torch.Tensor,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
         output: torch.Tensor,
+        output_gate: torch.Tensor,
     ) -> None:
         metadata = get_forward_context().attn_metadata
         if isinstance(metadata, list):
@@ -431,14 +437,11 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         if side_metadata.num_actual_tokens != num_tokens:
             raise RuntimeError("QSA main and side metadata token counts disagree")
         selected = self.indexer(
-            hidden_states,
+            projected_qk,
             positions,
             self.topk_indices_buffer[:num_tokens],
         )
-        if selected.shape != (
-            num_tokens,
-            self.indexer.packed_output_width,
-        ):
+        if selected.shape != (num_tokens, self.indexer.packed_output_width):
             raise RuntimeError("QSA indexer returned an invalid selection shape")
         impl = cast(Qwen4ExpQSAFlashAttentionImpl, self.impl)
         impl.do_kv_cache_update(
@@ -457,13 +460,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             main_metadata,
             output,
             token_to_req=side_metadata.token_to_req,
-            # 移植 v0.30.0: prefill 批 (max_query_len > decode 上限) 走 prefill
-            # 专用 tile 档; decode/verify 批走 decode 档 (差异只是 tile 调优,
-            # 不影响正确性)。FULL-graph 捕获时 max_query_len 是 uniform decode
-            # 长度, 判据在同一图内恒定 → capture-stable。
-            use_prefill_config=(
-                main_metadata.max_query_len > self._max_decode_query_len
-            ),
+            use_prefill_config=main_metadata.max_query_len > self._max_decode_query_len,
+            output_gate=output_gate,
         )
 
     def forward(
@@ -473,82 +471,29 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v, gate = self._project_qkv_gate(qkv, positions)
+        # gate 是 pre-sigmoid 的原始 output gate; v0.30 把 sigmoid 融合进
+        # qsa_sparse_paged_attention kernel (fp32 施加), 故此处直接把它作
+        # output_gate 传下去, 不再在模型层乘 sigmoid (删外部 *sigmoid)。
+        assert gate is not None
         num_tokens = hidden_states.shape[0]
         query = q.view(num_tokens, self.num_heads, self.head_dim)
         key = k.view(num_tokens, self.num_kv_heads, self.head_dim)
         value = v.view(num_tokens, self.num_kv_heads, self.head_dim)
         attn_output = torch.empty_like(query)
-        encoded_layer_name = _encode_layer_name(self.layer_name)
-        if current_platform.opaque_attention_op():
-            torch.ops.vllm.qwen4_exp_qsa_with_output(
-                hidden_states,
-                positions,
-                query,
-                key,
-                value,
-                attn_output,
-                encoded_layer_name,
-            )
-        else:
-            qwen4_exp_qsa_with_output(
-                hidden_states,
-                positions,
-                query,
-                key,
-                value,
-                attn_output,
-                encoded_layer_name,
-            )
+        # Keep the index projection outside the eager break.
+        projected_qk, _ = self.indexer.index_qk_proj(hidden_states)
+        self._run_qsa(
+            projected_qk,
+            positions,
+            query,
+            key,
+            value,
+            attn_output,
+            gate,
+        )
         flat_output = attn_output.view(num_tokens, -1)
-        if gate is not None:
-            flat_output = flat_output * torch.sigmoid(gate)
         output, _ = self.o_proj(flat_output)
         return output
-
-
-def qwen4_exp_qsa_with_output(
-    hidden_states: torch.Tensor,
-    positions: torch.Tensor,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    output: torch.Tensor,
-    layer_name: LayerNameType,
-) -> None:
-    """Run the complete QSA state/update/attend transaction."""
-
-    layer_name = _resolve_layer_name(layer_name)
-    layer = get_forward_context().no_compile_layers[layer_name]
-    if not isinstance(layer, Qwen4ExpQSAAttention):
-        raise TypeError(f"{layer_name} is not a Qwen4Exp QSA owner")
-    layer._run_qsa(
-        hidden_states,
-        positions,
-        query,
-        key,
-        value,
-        output,
-    )
-
-
-def qwen4_exp_qsa_with_output_fake(
-    hidden_states: torch.Tensor,
-    positions: torch.Tensor,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    output: torch.Tensor,
-    layer_name: LayerNameType,
-) -> None:
-    del hidden_states, positions, query, key, value, output, layer_name
-
-
-direct_register_custom_op(
-    op_name="qwen4_exp_qsa_with_output",
-    op_func=qwen4_exp_qsa_with_output,
-    mutates_args=["output"],
-    fake_impl=qwen4_exp_qsa_with_output_fake,
-)
 
 
 __all__ = [
@@ -556,5 +501,4 @@ __all__ = [
     "Qwen4ExpQSAAttention",
     "Qwen4ExpQSAFlashAttentionBackend",
     "Qwen4ExpQSAFlashAttentionImpl",
-    "qwen4_exp_qsa_with_output",
 ]

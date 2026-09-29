@@ -54,7 +54,15 @@ def firefly_ar_active() -> bool:
 
     与 firefly 权重路径 (VLLM_FIREFLY_DIRECT) 无关 —— 通信独立, 对任意 TP 都
     赚。旧取值 'auto'/'fp8' 已被 envs_sm75 归一化器并入开。
+
+    用户显式开 FlashInfer PCIe-IPC AR (VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC,
+    v0.30 底座才有, 默认 0 opt-in) 时让路: 二者都是抢 TP 组的小消息 AR, 不该并
+    存。FlashInfer 那条走 CUDA-IPC 显存句柄 (依赖 peer 映射), 在老 CC 卡会撞 205
+    自动 disabled; 用户既然显式开它, firefly 的默认开就此让位, 免得两个都 enabled
+    再靠 all_reduce 排序仲裁。getattr 兜底: 老底座 envs 无此项, 缺省视为未开。
     """
+    if getattr(envs, "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC", False):
+        return False
     return bool(envs.VLLM_FIREFLY_AR)
 
 
