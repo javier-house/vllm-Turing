@@ -8,7 +8,7 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 command -v docker >/dev/null
 # 构建源 commit 烤进镜像(供容器内 entrypoint 判断 overlay 是否最新); 无 git 时退化。
 SOURCE_REVISION="${SOURCE_REVISION:-$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || printf 'source-archive')}"
-BASE_IMAGE='vllm/vllm-openai:v0.29.0-cu129@sha256:7ef5a35d1ef8ce2cf9d671dd91eec6e367c5849262e0362b4d3d4a26be0d87d2'
+BASE_IMAGE='vllm/vllm-openai:v0.30.0-cu129@sha256:a67f8f186d4567612ac37a55bd82295006002b18858eb12a8af2f05f86c2ae3f'
 docker build --file "$ROOT/docker/Dockerfile" \
     --target final --build-arg BASE_IMAGE="$BASE_IMAGE" \
     --build-arg MAX_JOBS="${MAX_JOBS:-1}" \

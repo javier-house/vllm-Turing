@@ -10,7 +10,7 @@
 #   - flashinfer/transformers 支持离线安装: 先跑 docker/prefetch_deps.sh 把 wheel 下到
 #     docker/tmp/wheels(已 gitignore), 构建时若检测到对应 wheel 就离线装, 缺则在线下载。
 
-ARG BASE_IMAGE=vllm/vllm-openai:v0.29.0-cu129@sha256:7ef5a35d1ef8ce2cf9d671dd91eec6e367c5849262e0362b4d3d4a26be0d87d2
+ARG BASE_IMAGE=vllm/vllm-openai:v0.30.0-cu129@sha256:a67f8f186d4567612ac37a55bd82295006002b18858eb12a8af2f05f86c2ae3f
 
 # 1) 预编译 flash_qla GDN prefill .so(独立 build stage, 稳定内核, nvcc 慢, 编一次进镜像)
 #    只依赖 base 镜像里的 torch, 不需要 flashinfer, 故直接 FROM base。

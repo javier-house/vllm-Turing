@@ -13,7 +13,7 @@ DOCKERFILE = ROOT / 'docker' / 'Dockerfile'
 class BuildContract(unittest.TestCase):
     def test_official_prebuilt_base(self):
         text = DOCKERFILE.read_text(encoding='utf-8')
-        self.assertIn('vllm/vllm-openai:v0.29.0-cu129@sha256:', text)
+        self.assertIn('vllm/vllm-openai:v0.30.0-cu129@sha256:', text)
         script = (ROOT / 'docker/build.sh').read_text(encoding='utf-8')
         self.assertNotIn('git clone', script)
         self.assertNotIn('git init', script)
