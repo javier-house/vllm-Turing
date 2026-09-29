@@ -790,6 +790,7 @@ def main() -> None:
         "vllm_mtp_stage_local.py",
         "vllm_hc_dequant.py",
         "vllm_firefly_hc.py",
+        "sm75_mtp_norm.py",
     ]
     for relative in files:
         source = source_root / relative
@@ -839,21 +840,47 @@ def main() -> None:
     if "quantization.exl3 import Exl3Config" not in quant_text:
         quant_init.write_text(quant_text + exl3_hook)
 
-    # PLE(ngram) 大表 NVMe mmap: v0.30 起 Qwen4ExpNGramEmbedding 类从 ple_layer.py
-    # 搬到 ngram_embedding.py (ple_layer.py 仅 import)。往 ngram_embedding.py 末尾
-    # append 一行, 在类定义之后、实例化之前触发 maybe_apply (打 patch)。手法与上面
-    # envs hook 一致 (尾部 append + marker 判幂等)。文件不存在 (底座没带 qwen4_exp
-    # 模型) 则跳过 —— PLE mmap 只在该模型下有意义, 不影响其余行为。
+    # PLE(ngram) 两处改动, 都在 ngram_embedding.py: (1) fp8 表 pinned-lookup 改
+    # raw-byte 直拷 (inline 锚点替换); (2) 大表 NVMe mmap offload (末尾 append hook,
+    # 在类定义后触发 maybe_apply 打 patch)。v0.30 起 Qwen4ExpNGramEmbedding 类从
+    # ple_layer.py 搬到 ngram_embedding.py (ple_layer.py 仅 import)。读一次文件,
+    # 两个改动各自 marker 判幂等, 写一次。手法与上面 envs hook 一致。文件不存在
+    # (底座没带 qwen4_exp 模型) 则跳过 —— PLE 只在该模型下有意义, 不影响其余行为。
     ngram_emb_file = package_root / "models/qwen4_exp/nvidia/ngram_embedding.py"
     if ngram_emb_file.is_file():
+        ngram_emb_text = ngram_emb_file.read_text()
+        # PLE fp8 表 pinned-lookup raw-byte 直拷: fp8 权重走 pinned host 拷贝路径时,
+        # 原 PyTorch copy 会做 fp8->fp32->fp8 的 dtype 转换; 这里对 fp8 (e4m3/e5m2)
+        # 的 weight 与 output 改 .view(torch.uint8), 按 raw byte 直拷, bit-exact 且省
+        # 一次无意义往返。kernel 是纯 gather (无对 values 的算术) + fp8 恰好 1 字节/
+        # 元素, 故 view 后 embedding_dim 索引语义不变。非 fp8 (int8/int4/mem) 走原路。
+        # 幂等: 含 view(torch.uint8) 即已注入。断言防上游改锚点静默漏注入 (qwen4_exp
+        # 确定要跑, 锚点必须命中)。
+        if "view(torch.uint8)" not in ngram_emb_text:
+            ngram_emb_text = ngram_emb_text.replace(
+                "                self._uva_weight,\n"
+                "                flat_ids,\n"
+                "                output,\n",
+                "                self._uva_weight.view(torch.uint8) "
+                "if self.weight.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) "
+                "else self._uva_weight,\n"
+                "                flat_ids,\n"
+                "                output.view(torch.uint8) "
+                "if self.weight.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) "
+                "else output,\n",
+                1,
+            )
+            assert "self._uva_weight.view(torch.uint8)" in ngram_emb_text, (
+                "PLE fp8 锚点未匹配 (上游 ngram_embedding.py 变更?)")
+        # PLE 大表 NVMe mmap offload (idempotent)。
         ple_hook = (
             "\n# vllm-turing overlay: PLE 表 NVMe mmap offload (idempotent).\n"
             "import vllm.vllm_ple_mmap\n"
             "vllm.vllm_ple_mmap.maybe_apply(Qwen4ExpNGramEmbedding)\n"
         )
-        ngram_emb_text = ngram_emb_file.read_text()
         if "vllm.vllm_ple_mmap.maybe_apply" not in ngram_emb_text:
-            ngram_emb_file.write_text(ngram_emb_text + ple_hook)
+            ngram_emb_text = ngram_emb_text + ple_hook
+        ngram_emb_file.write_text(ngram_emb_text)
 
     # MTP 草稿头 stage-local: 往上游 qwen4_exp mtp.py 末尾 append 一行, 在
     # Qwen4ExpMultiTokenPredictor 类定义之后、实例化之前触发 maybe_apply (打 patch)。
@@ -864,14 +891,41 @@ def main() -> None:
     # vllm_mtp_stage_local.py 模块 docstring 的证据)。文件不存在 (底座没带模型) 跳过。
     mtp_file = package_root / "models/qwen4_exp/nvidia/mtp.py"
     if mtp_file.is_file():
+        mtp_text = mtp_file.read_text()
+        # MTP fused GemmaRMSNorm (triton): 两个 pre_fc_norm 走单 kernel, FP32 累加,
+        # sm75 无 bf16 纯 PyTorch 一串 elementwise 发射开销大。局部 import 在 forward
+        # 内 (方法前段), 第二个 norm 调用复用。幂等: 含 sm75_mtp_gemma_norm 即已注入。
+        # 断言防上游改锚点导致静默漏注入 (qwen4_exp 是我们确定要跑的模型, 锚点必须命中)。
+        if "sm75_mtp_gemma_norm" not in mtp_text:
+            mtp_text = mtp_text.replace(
+                "            inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)\n",
+                "            from vllm.sm75_mtp_norm import sm75_mtp_gemma_norm\n"
+                "            inputs_embeds = sm75_mtp_gemma_norm(\n"
+                "                inputs_embeds, self.pre_fc_norm_embedding\n"
+                "            )\n",
+                1,
+            )
+            mtp_text = mtp_text.replace(
+                "            hidden_states = self.pre_fc_norm_hidden(hidden_states.flatten(-2)).view(\n",
+                "            hidden_states = sm75_mtp_gemma_norm(\n"
+                "                hidden_states.flatten(-2), self.pre_fc_norm_hidden\n"
+                "            ).view(\n",
+                1,
+            )
+            assert "sm75_mtp_gemma_norm(\n                inputs_embeds" in mtp_text, (
+                "MTP norm embedding 锚点未匹配 (上游 mtp.py 变更?)")
+            assert "sm75_mtp_gemma_norm(\n                hidden_states" in mtp_text, (
+                "MTP norm hidden 锚点未匹配 (上游 mtp.py 变更?)")
+        # MTP 草稿头 stage-local: 类定义后 append hook, 删 PP>1 的两个 pp 分支
+        # (末 rank 草稿头拿目标模型 pp 位置会炸 assert)。见 vllm_mtp_stage_local.py。
         mtp_hook = (
             "\n# vllm-turing overlay: MTP drafter stage-local (idempotent).\n"
             "import vllm.vllm_mtp_stage_local\n"
             "vllm.vllm_mtp_stage_local.maybe_apply(Qwen4ExpMultiTokenPredictor)\n"
         )
-        mtp_text = mtp_file.read_text()
         if "vllm.vllm_mtp_stage_local.maybe_apply" not in mtp_text:
-            mtp_file.write_text(mtp_text + mtp_hook)
+            mtp_text = mtp_text + mtp_hook
+        mtp_file.write_text(mtp_text)
 
     # HC int8 权重 load 时 dequant: 往上游 qwen4_exp/nvidia/model.py 末尾 append 一行,
     # 给语言主干 Qwen4ExpModel (非顶层 CausalLM/ConditionalGeneration, 必被实例化, 是唯一

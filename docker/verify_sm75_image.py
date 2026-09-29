@@ -12,7 +12,7 @@ from pathlib import Path
 import torch
 
 EXPECTED_PACKAGES = {
-    "vllm": "0.29.0",
+    "vllm": "0.30.0",
     "flashinfer-python": "0.6.18",
     "flashinfer-cubin": "0.6.18",
     "transformers": "5.15.1",
