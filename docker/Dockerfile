@@ -110,12 +110,13 @@ RUN python3 /opt/vllm-turing/patch_transformers_startup.py && \
     python3 /opt/vllm-turing/verify_sm75_image.py && \
     test -s /opt/vllm-turing/extensions/flash_qla_sm75_gdn.so
 
-# firefly 默认开(int4 走 int8 prefill, fp8 走 marlin); flashqla 用镜像预编译(禁 JIT)
+# firefly 默认开(auto: int4 现反 int8 prefill + int8 权重直接进 GEMM, fp8 走 marlin);
+# flashqla 用镜像预编译(禁 JIT)
 ENV FLASH_QLA_SM75_PREBUILT_EXTENSION_PATH=/opt/vllm-turing/extensions/flash_qla_sm75_gdn.so \
     FLASH_QLA_SM75_ALLOW_JIT=0 \
     PYTHONWARNINGS=ignore::FutureWarning \
     TRANSFORMERS_VERBOSITY=error \
-    VLLM_FIREFLY=auto \
+    VLLM_FIREFLY_DIRECT=1 \
     VLLM_USE_MODELSCOPE=true \
     MODELSCOPE_CACHE=/root/.cache/modelscope/hub \
     SM75_FA2_SMALLQ_GRAPH=1 \

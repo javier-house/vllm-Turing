@@ -149,7 +149,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if use_firefly_ar:
             # FireflyAllReduce: fp8 allreduce, 任意 2 的幂 world (2/4/8/16/...)。
             # 2 卡走 SHM(无 P2P 如 T10)/P2P; N>=4 走 P2P butterfly (IPC 显存,
-            # 需全互联)。VLLM_FIREFLY_AR auto 跟随 VLLM_FIREFLY; 只 fp16 +
+            # 需全互联)。VLLM_FIREFLY_AR 纯开关(默认开, 0=关); 只 fp16 +
             # <= max_size。backend/disabled 在类内判定, 不适用时 disabled=True
             # 自动回退 NCCL。
             from .firefly_allreduce import FireflyAllReduce

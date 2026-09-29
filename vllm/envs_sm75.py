@@ -9,7 +9,7 @@ append 到上游 envs.py 尾部触发注入。注入做两件事:
 
 1) 把 EXTENSIONS getter 灌进 vllm.envs.environment_variables —— 上游
    __getattr__ / __dir__ / is_set / validate_environ / enable_envs_cache
-   全围绕该 dict, 灌入后 envs.VLLM_FIREFLY 等属性访问自动生效(无需改调用方)。
+   全围绕该 dict, 灌入后 envs.VLLM_FIREFLY_DIRECT 等属性访问自动生效(无需改调用方)。
 2) 包一层 vllm.envs.compile_factors, 把 INSTALL_IGNORED(idle auto-sleep 计时器)
    从 hash factors pop 掉 —— 它们只影响调度/checkpoint, 不改变编译图。
 
@@ -30,35 +30,41 @@ INSTALL_IGNORED = {
 }
 
 
-def _firefly_mode() -> str:
-    """VLLM_FIREFLY 归一化: 默认开。
+def _firefly_direct() -> bool:
+    """VLLM_FIREFLY_DIRECT 归一化: 默认开 (auto)。firefly 族总开关, 统管:
 
-    未设/空 = 开('1', 默认激活 firefly prefill); '0'/'off'/'false'/'no' = 关
-    (回退全上游 marlin); 其余值 ('1'/'auto'/'on'/'true'/'yes') 都算开。
-    开 = int4(AWQ/GPTQ) 走 int8 加速, fp8 走上游 marlin(fp8 加速走
-    VLLM_FIREFLY_AR fp8 allreduce, 另见 PLAN-fp8-allreduce)。
+    - int4(AWQ/GPTQ, W4A16) prefill 现反量化 int8 走 CUTLASS(IMMA)
+      (utils/firefly.py, MarlinLinearKernel 混合路径);
+    - int8 权重 (compressed-tensors int-quantized) 直接进 firefly int8 GEMM
+      (utils/firefly_int8.py, W8A16/W8A8)。
+
+    未设/'auto'/'1'/'on'/'true'/'yes' = 开(合适权重自动启用); '0'/'off'/'false'/
+    'no' = 关(回退全上游 marlin)。fp8 权重恒走 marlin, fp8 通信加速走
+    VLLM_FIREFLY_AR(独立开关)。纯运行时路径选择, 不改编译图 → pop 出
+    compile_factors 复用历史编译产物。
     """
-    v = os.getenv("VLLM_FIREFLY", "").strip().lower()
-    if v in ("0", "off", "false", "no"):
-        return "0"
-    return "1"
+    return os.getenv("VLLM_FIREFLY_DIRECT", "").strip().lower() not in (
+        "0",
+        "off",
+        "false",
+        "no",
+    )
 
 
-def _firefly_ar_mode() -> str:
-    """VLLM_FIREFLY_AR 归一化: 'auto'(默认, 跟随 VLLM_FIREFLY) / '0'=强制关 /
-    'fp8'=强制开。
+def _firefly_ar_mode() -> bool:
+    """VLLM_FIREFLY_AR 归一化: 纯开关, 默认开; '0'/'off'/'false'/'no' 关。
 
-    auto = firefly 模式开 (VLLM_FIREFLY=1) 时 fp8 allreduce 自动启用 (fp8 近乎
-    无损, PLAN-fp8-allreduce §3.5); firefly 关 → AR 关。'fp8' 单独开 (firefly
-    不用也开 AR); '0' 单独关 (firefly 开但 AR 不用)。FireflyAllReduce 只做 fp8,
-    双 backend (P2P / SHM, 见 VLLM_FIREFLY_AR_BACKEND)。
+    fp8 allreduce (FireflyAllReduce, 双 backend P2P/SHM, 见
+    VLLM_FIREFLY_AR_BACKEND) 是否启用, 与 firefly 权重路径无关(通信独立),
+    fp8 近乎无损(PLAN-fp8-allreduce §3.5)。旧取值 'auto'(跟随总开关)/'fp8'
+    一并归开, 兼容历史脚本。纯运行时选择 → pop 出 compile_factors。
     """
-    v = os.getenv("VLLM_FIREFLY_AR", "").strip().lower()
-    if v in ("0", "off", "false", "no"):
-        return "0"
-    if v in ("fp8", "1", "on", "true", "yes"):
-        return "fp8"
-    return "auto"
+    return os.getenv("VLLM_FIREFLY_AR", "1").strip().lower() not in (
+        "0",
+        "off",
+        "false",
+        "no",
+    )
 
 
 def _firefly_ar_backend() -> str:
@@ -95,7 +101,7 @@ def _firefly_ar_pipe() -> bool:
 
 
 def _firefly_defer_recv() -> bool:
-    """VLLM_FIREFLY_DEFER 归一化: auto(默认, 跟随 VLLM_FIREFLY) / 0 = 强制关。
+    """VLLM_FIREFLY_DEFER 归一化: 纯开关, 默认开; '0'/'off'/'false'/'no' 关。
 
     开 = PP>1 时非首 stage 的 execute_model 不再在入口阻塞收 pickled tensor
     metadata(那 metadata 只有上一 stage launch 完才发, 把本 rank 的 host 侧输入/
@@ -108,12 +114,12 @@ def _firefly_defer_recv() -> bool:
     pop 出 compile_factors 复用历史编译产物。见 install_sm75_overlay.py 的
     v1/worker/gpu_worker.py 注入(DeferredRecvIntermediateTensors)。
     """
-    v = os.getenv("VLLM_FIREFLY_DEFER", "").strip().lower()
-    if v in ("0", "off", "false", "no"):
-        return False
-    if v in ("1", "on", "true", "yes"):
-        return True
-    return _firefly_mode() == "1"
+    return os.getenv("VLLM_FIREFLY_DEFER", "1").strip().lower() not in (
+        "0",
+        "off",
+        "false",
+        "no",
+    )
 
 
 def _monitor() -> bool:
@@ -287,14 +293,15 @@ def _firefly_hc() -> bool:
 # SM75 自定义 env → getter。install 时灌进 vllm.envs.environment_variables,
 # 之后 envs.<NAME> 属性访问 / is_set / validate_environ / __dir__ 自动生效。
 EXTENSIONS: dict[str, object] = {
-    # firefly(SM75) prefill 加速总开关, 默认开(_firefly_mode 归一化):
-    #   未设 / 1 / auto = 开(默认激活): int4(AWQ/GPTQ, W4A16) 走 int8 加速;
-    #     fp8 走上游 marlin(sm75 实测 firefly-fp8 不比 marlin 快, 已移除; fp8
-    #     加速改走 VLLM_FIREFLY_AR fp8 allreduce, 见 PLAN-fp8-allreduce)。
+    # firefly(SM75) 族总开关, 默认开(auto, _firefly_direct 归一化):
+    #   未设 / auto / 1 = 开(合适权重自动启用): int4(AWQ/GPTQ, W4A16) prefill
+    #     现反 int8 走 CUTLASS(IMMA), 小 M/decode 保持 marlin; int8 权重
+    #     (W8A16/W8A8) 直接进 firefly int8 GEMM。
     #   0 = 关(全走上游 marlin)。
-    # 大 M 现反量化成 int8 走 CUTLASS(IMMA), 小 M/decode 保持 marlin。见
-    # model_executor/layers/quantization/utils/firefly.py。
-    "VLLM_FIREFLY": _firefly_mode,
+    # fp8 权重恒走 marlin(sm75 实测 firefly-fp8 不比 marlin 快, 已移除; fp8
+    # 通信加速走 VLLM_FIREFLY_AR, 见 PLAN-fp8-allreduce)。纯运行时路径选择,
+    # 不改编译图 → pop 出 compile_factors。见 utils/firefly.py / firefly_int8.py。
+    "VLLM_FIREFLY_DIRECT": _firefly_direct,
     # 默认 1024: T10 上 p3_perf_sweep(6144x5120 层)测得 int8 反量化 ~1ms/层
     # (M 无关地板), crossover M≈854; M>1024 int8 才稳定快于 marlin(1.13-1.33x)。
     "VLLM_FIREFLY_MIN_M": lambda: int(
@@ -305,10 +312,10 @@ EXTENSIONS: dict[str, object] = {
     "VLLM_FIREFLY_DEQUANT_MODEL": lambda: (
         os.environ.get("VLLM_FIREFLY_DEQUANT_MODEL", "def")
     ),
-    # fp8 allreduce (FireflyAllReduce, SHM backend, 无 P2P 如 T10)。auto(默认)
-    # 跟随 VLLM_FIREFLY (firefly 开→AR 自动开); fp8 单独开; 0 单独关。TP2 每层 2 次
-    # AllReduce 量减半 (fp16->fp8), 省 ~480-530ms/27B prefill。见
-    # distributed/device_communicators/firefly_allreduce.py / PLAN-fp8-allreduce。
+    # fp8 allreduce (FireflyAllReduce) 开关, 默认开(_firefly_ar_mode 归一化,
+    # 纯开关); 0 单独关。与 firefly 权重路径无关(通信独立, 对任意 TP 都赚)。
+    # TP2 每层 2 次 AllReduce 量减半 (fp16->fp8), 省 ~480-530ms/27B prefill。
+    # 见 distributed/device_communicators/firefly_allreduce.py / PLAN-fp8-allreduce。
     "VLLM_FIREFLY_AR": _firefly_ar_mode,
     # 只对大消息走 FireflyAllReduce, 小消息回退 NCCL。decode 小消息 (几百 KB)
     # 时 firefly 的 amax 扫描 + 多轮 flag spin 固定开销可能超过砍半省下的传输
@@ -376,7 +383,7 @@ EXTENSIONS: dict[str, object] = {
     # 开 = HC 三投影单流 decode 走融合标量 GEMV(sm75, 不用 tl.dot); 改 decode 图内
     # 算子 → 参与编译 hash, 不 pop。见 vllm_firefly_hc.py。
     "VLLM_FIREFLY_HC": _firefly_hc,
-    # firefly PP deferred-recv 开关, 默认 auto 跟随 VLLM_FIREFLY(_firefly_defer_recv)。
+    # firefly PP deferred-recv 开关, 默认开(_firefly_defer_recv 归一化, 纯开关)。
     # 开 = PP>1 非首 stage 把 irecv 从 execute_model 入口推迟到 forward 前, host
     # 准备与上一 stage GPU 计算重叠(设备顺序不变, 逐 bit 一致); 0 = 入口即收(回退)。
     # PP1(当前 TP8)恒 no-op。纯 host 调度顺序, 不改编译图 → pop 复用编译产物。
@@ -451,9 +458,14 @@ def apply() -> None:
             # 复用既有生产编译产物 (getter 实际仍按 env 原值生效)。
             factors.pop("VLLM_PLE_MEM_LAZY", None)
             factors.pop("VLLM_PLE_MEM_FILL_WORKERS", None)
-            # firefly deferred-recv 纯 host 调度顺序(PP recv 时机), 不改编译图、
-            # 数值逐 bit 一致; 新增 env, 历史编译签名无此 key, pop 掉对齐复用既有
-            # 生产编译产物(getter 仍按 VLLM_FIREFLY_DEFER 原值生效)。
+            # firefly 族三个 env 都是纯运行时选择(权重路径 / 通信 backend / PP
+            # recv 时机), 不改编译图、数值逐 bit 一致; 历史编译签名无对应 key,
+            # pop 掉对齐复用既有生产编译产物(getter 仍按 env 原值生效)。
+            # DIRECT 取代旧 VLLM_FIREFLY(历史签名有该 key): pop 旧 key 避免
+            # 已设旧 env 时 hash 漂移, 新 key 一并 pop。
+            factors.pop("VLLM_FIREFLY", None)
+            factors.pop("VLLM_FIREFLY_DIRECT", None)
+            factors.pop("VLLM_FIREFLY_AR", None)
             factors.pop("VLLM_FIREFLY_DEFER", None)
             return factors
 

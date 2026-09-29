@@ -28,8 +28,8 @@ logger = logging.getLogger(__name__)
 
 
 def firefly_active_int4() -> bool:
-    """int4(W4A16) 是否走 firefly prefill: VLLM_FIREFLY 开(1/auto 等价)。"""
-    return envs.VLLM_FIREFLY == "1"
+    """int4(W4A16) 是否走 firefly prefill: VLLM_FIREFLY_DIRECT 开(auto/1 等价)。"""
+    return bool(envs.VLLM_FIREFLY_DIRECT)
 
 
 def firefly_active_fp8() -> bool:

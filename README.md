@@ -75,7 +75,7 @@ docker run -d --name vllm-turing-fp8 --gpus all --shm-size 16g \
   -v "$VLLM_SM75_CACHE_ROOT/shared/flashinfer":/root/.cache/flashinfer \
   -v "$VLLM_SM75_CACHE_ROOT/fp8/triton":/root/.triton/cache \
   -v "$VLLM_SM75_CACHE_ROOT/shared/torch_extensions":/root/.cache/torch_extensions \
-  -e VLLM_FIREFLY=1 -e VLLM_FIREFLY_AR=auto -e VLLM_TURING_UPDATE=1 \
+  -e VLLM_FIREFLY_DIRECT=1 -e VLLM_FIREFLY_AR=1 -e VLLM_TURING_UPDATE=1 \
   -e TRITON_CACHE_DIR=/root/.triton/cache -e TORCH_EXTENSIONS_DIR=/root/.cache/torch_extensions \
   vllm-turing Qwen/Qwen3.8-27B-FP8 \
   --served-model-name VLLM-Qwen3.8-27B --host 0.0.0.0 --port 8000 --api-key "$VLLM_API_KEY" \
@@ -101,7 +101,7 @@ docker run -d --name vllm-turing-fp8 --gpus all --shm-size 16g \
   -v "$VLLM_SM75_CACHE_ROOT/shared/flashinfer":/root/.cache/flashinfer \
   -v "$VLLM_SM75_CACHE_ROOT/fp8/triton":/root/.triton/cache \
   -v "$VLLM_SM75_CACHE_ROOT/shared/torch_extensions":/root/.cache/torch_extensions \
-  -e VLLM_FIREFLY=1 -e VLLM_FIREFLY_AR=auto -e VLLM_TURING_UPDATE=1 \
+  -e VLLM_FIREFLY_DIRECT=1 -e VLLM_FIREFLY_AR=1 -e VLLM_TURING_UPDATE=1 \
   -e TRITON_CACHE_DIR=/root/.triton/cache -e TORCH_EXTENSIONS_DIR=/root/.cache/torch_extensions \
   vllm-turing Qwen/Qwen3.8-27B-FP8 \
   --served-model-name VLLM-Qwen3.8-27B --host 0.0.0.0 --port 8000 --api-key "$VLLM_API_KEY" \
@@ -128,7 +128,7 @@ docker run -d --name vllm-turing-fp8 --gpus all --shm-size 16g \
   -v "$VLLM_SM75_CACHE_ROOT/shared/flashinfer":/root/.cache/flashinfer \
   -v "$VLLM_SM75_CACHE_ROOT/fp8/triton":/root/.triton/cache \
   -v "$VLLM_SM75_CACHE_ROOT/shared/torch_extensions":/root/.cache/torch_extensions \
-  -e VLLM_FIREFLY=1 -e VLLM_FIREFLY_AR=auto \
+  -e VLLM_FIREFLY_DIRECT=1 -e VLLM_FIREFLY_AR=1 \
   -e TRITON_CACHE_DIR=/root/.triton/cache -e TORCH_EXTENSIONS_DIR=/root/.cache/torch_extensions \
   vllm-turing Qwen/Qwen3.8-27B-FP8 \
   --served-model-name VLLM-Qwen3.8-27B --host 0.0.0.0 --port 8000 --api-key "$VLLM_API_KEY" \
@@ -171,11 +171,11 @@ curl --fail http://localhost:8000/v1/models \
 
 INT4 路径用于大批量 prefill；本版本 FP8 线性计算仍使用 Marlin，FP8 测试启用的是 Firefly all-reduce。不能把未启用的 FP8 线性内核或其他模型数据作为当前27B的加速结果。
 
-示例默认 `-e VLLM_FIREFLY=1 -e VLLM_FIREFLY_AR=auto`，通信后端自动选择，阈值为1MiB；小消息回退 NCCL。为匹配已测路径，独立的官方 FlashInfer all-reduce 默认设为0。Firefly 用上面 `docker run` 里的 `-e` 调整即可：
+示例默认 `-e VLLM_FIREFLY_DIRECT=1 -e VLLM_FIREFLY_AR=1`，通信后端自动选择，阈值为1MiB；小消息回退 NCCL。为匹配已测路径，独立的官方 FlashInfer all-reduce 默认设为0。Firefly 用上面 `docker run` 里的 `-e` 调整即可：
 
 ```bash
 # 关闭 Firefly 计算和通信优化：把示例里两处 -e 改成
-  -e VLLM_FIREFLY=0 -e VLLM_FIREFLY_AR=0
+  -e VLLM_FIREFLY_DIRECT=0 -e VLLM_FIREFLY_AR=0
 # 只关闭 Firefly all-reduce
   -e VLLM_FIREFLY_AR=0
 ```

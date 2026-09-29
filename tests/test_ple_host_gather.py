@@ -53,9 +53,9 @@ def test_ple_host_gather_registered_not_popped(monkeypatch):
     assert "VLLM_PLE_HOST_GATHER" in envs_sm75.EXTENSIONS
     # 模拟 apply() 后 compile_factors: 该 key 必须存活 (参与编译 hash)。
     fake_envs = types.ModuleType("vllm.envs")
-    fake_envs.environment_variables = {"VLLM_FIREFLY": lambda: "0"}
+    fake_envs.environment_variables = {"VLLM_FIREFLY_DIRECT": lambda: True}
     fake_envs.compile_factors = lambda: {
-        "VLLM_FIREFLY": "0",
+        "VLLM_FIREFLY_DIRECT": True,  # firefly 族纯运行时, 应被 pop
         "VLLM_PLE_HOST_GATHER": True,
         "VLLM_PLE_MEM_LAZY": True,  # lazy 是运行时, 应被 pop
         "VLLM_PLE_MEM_FILL_WORKERS": 16,  # 同上
@@ -66,6 +66,7 @@ def test_ple_host_gather_registered_not_popped(monkeypatch):
     assert "VLLM_PLE_HOST_GATHER" in factors  # 不 pop: 开关各用各编译产物
     assert "VLLM_PLE_MEM_LAZY" not in factors
     assert "VLLM_PLE_MEM_FILL_WORKERS" not in factors
+    assert "VLLM_FIREFLY_DIRECT" not in factors  # firefly 族纯运行时, pop
 
 
 # --------------------------------------------------------------------------- #

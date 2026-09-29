@@ -690,10 +690,11 @@ INJECTIONS: list[tuple[str, list[tuple[str, str, str]]]] = [
         # NotImplementedError。增量注入 (不整文件覆盖): 在 compressed_tensors.py
         # **文件末尾** append import + maybe_apply() 调用 —— 模块加载时即
         # monkey-patch CompressedTensorsConfig.get_scheme, 早于任何 get_scheme
-        # 调用 (每个 Linear 层配置 get_quant_method 时被调)。VLLM_FIREFLY 开启时
-        # 命中的 int8 per-channel 层切到 firefly int8 GEMM, 否则 maybe_apply
-        # 直接 return (no-op, 不碰上游)。maybe_apply 幂等 (防重复 import 二次
-        # patch)。anchor 取文件末尾唯一且稳定的 del 块 (EOF 处)。
+        # 调用 (每个 Linear 层配置 get_quant_method 时被调)。
+        # VLLM_FIREFLY_DIRECT 开启时命中的 int8 per-channel 层切到 firefly
+        # int8 GEMM, 否则 maybe_apply 直接 return (no-op, 不碰上游)。maybe_apply
+        # 幂等 (防重复 import 二次 patch)。anchor 取文件末尾唯一且稳定的 del
+        # 块 (EOF 处)。
         "model_executor/layers/quantization/compressed_tensors/compressed_tensors.py",
         [(
             "        # Discard all placeholders.\n"
@@ -712,8 +713,8 @@ INJECTIONS: list[tuple[str, list[tuple[str, str, str]]]] = [
             "        del layer.q_zero_point\n"
             "\n"
             "\n"
-            "# SM75 firefly int8: 模块加载时打 monkey-patch (VLLM_FIREFLY 开启时把\n"
-            "# int8 权重 per-channel 层 (W8A16/W8A8) 切到 firefly int8 GEMM, 否则 no-op)。\n"
+            "# SM75 firefly int8: 模块加载时打 monkey-patch (VLLM_FIREFLY_DIRECT\n"
+            "# 开启时把 int8 权重 per-channel 层 (W8A16/W8A8) 切到 firefly int8 GEMM, 否则 no-op)。\n"
             "from vllm.model_executor.layers.quantization.utils import (\n"
             "    firefly_int8 as _ff_int8,\n"
             ")\n"
@@ -792,7 +793,7 @@ INJECTIONS: list[tuple[str, list[tuple[str, str, str]]]] = [
                 '\n'
                 '\n'
                 'def _defer_pp_recv() -> bool:\n'
-                '    """firefly deferred-recv 开关: VLLM_FIREFLY_DEFER, auto 跟随总开关。"""\n'
+                '    """firefly deferred-recv 开关: VLLM_FIREFLY_DEFER (纯开关, 默认开)。"""\n'
                 '    return envs.VLLM_FIREFLY_DEFER\n'
                 '\n'
                 '\n'

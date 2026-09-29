@@ -16,7 +16,8 @@ raise NotImplementedError, 故需本 scheme 接管。
 
 接入方式: maybe_apply() monkey-patch CompressedTensorsConfig.get_scheme —— 命中
 上述 int8 权重条件时返回 FireflyInt8Scheme, 其余情况原样调原 get_scheme。只在
-firefly 总开关 VLLM_FIREFLY 开启 (1/auto) 时打 patch; 关则完全不碰上游 (行为不变)。
+firefly 族总开关 VLLM_FIREFLY_DIRECT 开启 (auto/1) 时打 patch; 关则完全不碰上游
+(行为不变)。生效状态打一行 info 日志, 排查"int8 层为什么走了 firefly"不靠反推。
 幂等: 原函数打标记属性 ._sm75_int8_patched, 二次 import 不重复 patch。
 """
 
@@ -44,23 +45,22 @@ _PATCHED_FLAG = "_sm75_int8_patched"
 _INT8_WEIGHT_FORMATS = ("int-quantized", "naive-quantized")
 
 
-def _firefly_on() -> bool:
-    """firefly 总开关是否开: 优先复用 vllm.envs_sm75._firefly_mode (与上游
-    VLLM_FIREFLY 语义一致: 未设/0=关, 1/auto/on/true/yes=开); 该模块不可用时
-    回退直接读环境变量 (归一化规则相同)。"""
+def _firefly_direct_on() -> bool:
+    """VLLM_FIREFLY_DIRECT 是否开: 优先复用 vllm.envs_sm75._firefly_direct
+    (auto/1/on/true/yes=开, 0/off/false/no=关); 该模块不可用时回退直接读
+    环境变量 (归一化规则相同)。"""
     try:
-        from vllm.envs_sm75 import _firefly_mode
+        from vllm.envs_sm75 import _firefly_direct
 
-        return _firefly_mode() == "1"
+        return _firefly_direct()
     except Exception:  # noqa: BLE001 - 无该模块/无 CUDA 环境时回退直读 env
         import os
 
-        return os.getenv("VLLM_FIREFLY", "").strip().lower() in (
-            "1",
-            "auto",
-            "on",
-            "true",
-            "yes",
+        return os.getenv("VLLM_FIREFLY_DIRECT", "").strip().lower() not in (
+            "0",
+            "off",
+            "false",
+            "no",
         )
 
 
@@ -216,15 +216,15 @@ def _is_sm75_int8(
 
 
 def maybe_apply() -> None:
-    """firefly 开启时 monkey-patch CompressedTensorsConfig.get_scheme。
+    """VLLM_FIREFLY_DIRECT 开启时 monkey-patch CompressedTensorsConfig.get_scheme。
 
     命中的 int8 权重层 (W8A16/W8A8) 返回 FireflyInt8Scheme, 其余原样调原
-    get_scheme。仅在
-    VLLM_FIREFLY 开启时 patch, 幂等 (防重复 import 二次 patch); 失败静默
-    (不破坏 compressed-tensors 主链路)。由 compressed_tensors.py 末尾的
-    overlay 注入调用。
+    get_scheme。仅在 VLLM_FIREFLY_DIRECT 开启时 patch, 幂等 (防重复 import
+    二次 patch); 失败静默 (不破坏 compressed-tensors 主链路)。由
+    compressed_tensors.py 末尾的 overlay 注入调用。
     """
-    if not _firefly_on():
+    if not _firefly_direct_on():
+        logger.info("SM75 firefly int8: VLLM_FIREFLY_DIRECT off, scheme 不启用")
         return
 
     try:
