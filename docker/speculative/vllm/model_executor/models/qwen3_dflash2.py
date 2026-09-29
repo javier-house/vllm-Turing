@@ -40,6 +40,25 @@ def _use_sm75_bf16_emulation() -> bool:
     return current_platform.is_cuda() and current_platform.is_device_capability(75)
 
 
+def _use_sm75_tp_context_fc(
+    fc: nn.Module, config, use_aux_hidden_state: bool
+) -> bool:
+    """draft MLP 量化时, 未量化的 context FC 也要切分。
+
+    fc 默认是 ReplicatedLinear(每 rank 一份完整副本)。改成 ColumnParallelLinear
+    切输出维, 每 rank 只存 5120/tp, gather 回完整输出——机制对任意 tp 成立, 故
+    放开到 tp>=2, 不只是 tp4。形状门 (25600/5120) 是特定 draft 头的特征, 保留。
+    """
+    return (
+        _use_sm75_bf16_emulation()
+        and get_tensor_model_parallel_world_size() >= 2
+        and isinstance(fc.quant_method, UnquantizedLinearMethod)
+        and use_aux_hidden_state
+        and fc.input_size == 25600
+        and config.hidden_size == 5120
+    )
+
+
 def _grouped_conv(
     hidden_states: torch.Tensor,
     delta: torch.Tensor,
@@ -290,13 +309,9 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
         draft_config = self.config.dflash_config
         # 可移植的 TP4 context-FC 切分 (移植自参考实现)。
         # 用现有 SM75 linear 实现, 不用 SM70 专用 kernel。
-        if (
-            _use_sm75_bf16_emulation()
-            and get_tensor_model_parallel_world_size() == 4
-            and self.quant_config is None
-            and self.use_aux_hidden_state
-            and self.fc.input_size == 25600
-            and self.config.hidden_size == 5120
+        # 只要 FC 本身未量化就切分, 不再要求整个 draft 都不量化。
+        if _use_sm75_tp_context_fc(
+            self.fc, self.config, self.use_aux_hidden_state
         ):
             self.fc = ColumnParallelLinear(
                 input_size=25600,
