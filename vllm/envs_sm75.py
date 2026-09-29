@@ -94,6 +94,28 @@ def _firefly_ar_pipe() -> bool:
     )
 
 
+def _firefly_defer_recv() -> bool:
+    """VLLM_FIREFLY_DEFER 归一化: auto(默认, 跟随 VLLM_FIREFLY) / 0 = 强制关。
+
+    开 = PP>1 时非首 stage 的 execute_model 不再在入口阻塞收 pickled tensor
+    metadata(那 metadata 只有上一 stage launch 完才发, 把本 rank 的 host 侧输入/
+    attention-metadata 准备全卡在"等上一 rank launch"之后), 而是把这次 irecv
+    推迟到 model runner 真正要读 intermediate tensors 的那一刻(forward 正前方),
+    让 host 准备与上一 stage 的 GPU 计算重叠。设备操作顺序不变(recv→forward→
+    send), 数值逐 bit 一致。仅 PP>1 非首 stage 生效; PP1(如当前 TP8 生产)恒
+    is_first_rank → 不进该分支 = 完全 no-op, 故默认开对现有生产零影响。
+    0 = 旧行为(入口即收), 作回退保险丝。纯 host 调度顺序改动, 不改编译图 →
+    pop 出 compile_factors 复用历史编译产物。见 install_sm75_overlay.py 的
+    v1/worker/gpu_worker.py 注入(DeferredRecvIntermediateTensors)。
+    """
+    v = os.getenv("VLLM_FIREFLY_DEFER", "").strip().lower()
+    if v in ("0", "off", "false", "no"):
+        return False
+    if v in ("1", "on", "true", "yes"):
+        return True
+    return _firefly_mode() == "1"
+
+
 def _monitor() -> bool:
     """VLLM_MONITOR 归一化: 默认开; '0'/'off'/'false'/'no' 关。
 
@@ -354,6 +376,12 @@ EXTENSIONS: dict[str, object] = {
     # 开 = HC 三投影单流 decode 走融合标量 GEMV(sm75, 不用 tl.dot); 改 decode 图内
     # 算子 → 参与编译 hash, 不 pop。见 vllm_firefly_hc.py。
     "VLLM_FIREFLY_HC": _firefly_hc,
+    # firefly PP deferred-recv 开关, 默认 auto 跟随 VLLM_FIREFLY(_firefly_defer_recv)。
+    # 开 = PP>1 非首 stage 把 irecv 从 execute_model 入口推迟到 forward 前, host
+    # 准备与上一 stage GPU 计算重叠(设备顺序不变, 逐 bit 一致); 0 = 入口即收(回退)。
+    # PP1(当前 TP8)恒 no-op。纯 host 调度顺序, 不改编译图 → pop 复用编译产物。
+    # 见 install_sm75_overlay.py 的 v1/worker/gpu_worker.py 注入。
+    "VLLM_FIREFLY_DEFER": _firefly_defer_recv,
     # A3(sm75 参考): custom allreduce 在 cuda graph capture 时的图输入策略。
     # auto=full decode 走 registered 快路径, piecewise/prefill 回退 staging
     # buffer(sm75 图私有大 buffer 无法经 CUDA IPC 导出); registered/staging
@@ -423,6 +451,10 @@ def apply() -> None:
             # 复用既有生产编译产物 (getter 实际仍按 env 原值生效)。
             factors.pop("VLLM_PLE_MEM_LAZY", None)
             factors.pop("VLLM_PLE_MEM_FILL_WORKERS", None)
+            # firefly deferred-recv 纯 host 调度顺序(PP recv 时机), 不改编译图、
+            # 数值逐 bit 一致; 新增 env, 历史编译签名无此 key, pop 掉对齐复用既有
+            # 生产编译产物(getter 仍按 VLLM_FIREFLY_DEFER 原值生效)。
+            factors.pop("VLLM_FIREFLY_DEFER", None)
             return factors
 
         _compile_factors_sm75._sm75_wrapped = True  # type: ignore[attr-defined]

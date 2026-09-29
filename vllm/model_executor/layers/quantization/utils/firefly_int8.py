@@ -78,7 +78,7 @@ class FireflyInt8Scheme(CompressedTensorsScheme):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        # Turing (sm75) 及以上; 与 WNA16 一致。
+        # sm75 及以上; 与 WNA16 一致。
         return 75
 
     def create_weights(

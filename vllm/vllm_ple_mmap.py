@@ -3,7 +3,7 @@
 
 背景: Qwen3.8-Flash-Next (qwen4_exp) 有一个 105GB 级的 ngram PLE 表
 (``ngram_embedding`` 128 片, 每片 [2500012, 160] BF16)。vLLM 默认把它整块
-常驻 GPU (VocabParallelEmbedding), 11G 的 2080Ti 根本装不下。但每个 token 只
+常驻 GPU (VocabParallelEmbedding), 小显存卡 (11G) 根本装不下。但每个 token 只
 lookup 16 行 x 160 列 (ngram_heads=16, head_dim=160), 所以这张表可以整盘留在
 NVMe、靠内核 page cache 换页, 按行 gather —— 正是 llama.cpp 对 GGUF 的 mmap
 做法。
@@ -205,7 +205,7 @@ def _env_int(name: str, default: int) -> int:
 
 
 def mode() -> str:
-    """ngram(PLE) 表的 offload 模式, 三选一可独立设置 (对齐 1Cat 三模式):
+    """ngram(PLE) 表的 offload 模式, 三选一可独立设置:
 
     - ``disk`` (默认 / 或 ``VLLM_PLE_MMAP=1``): 磁盘 ``np.memmap``, page cache 换页。
       表 ~95G 走 NVMe, 不进显存/常驻 RAM, 适合主机内存有限时。
@@ -864,7 +864,7 @@ def _ensure_splitting_op() -> None:
     背景: 本 op 内做 CPU gather + pageable H2D (``ids.to("cpu")`` / rows H2D),
     这些 D2H/H2D 拷贝在 CUDA graph capture 期间非法 (除非 pinned)。PIECEWISE
     cudagraph 会把图里每个非 split 点算子 capture 进 graph, 故必须把本 op 变成
-    Dynamo FX 的 split 点, 让它在 capture 之外 eager 执行。对齐 1Cat: 其 PLE op
+    Dynamo FX 的 split 点, 让它在 capture 之外 eager 执行。参考实现把 PLE op
     列在 ``CompilationConfig._attention_ops`` (PIECEWISE split 点列表)。
 
     timing: ``set_splitting_ops_for_v1`` 在 VllmConfig 初始化 (model 加载前) 就已把
@@ -902,8 +902,8 @@ def _ple_out_dtype(self) -> torch.dtype:
     FP8 表保留原生 fp8 (留给上游 ``_dequantize_embeddings`` 乘 weight_scale);
     bf16/f16 表改为 model dtype —— sm75 无 bf16 计算, 模型回退 fp16, 若输出保留表
     原生 bf16 会污染后续 fp16 激活 (model.py 里 hidden + ple -> 类型提升成 bf16 ->
-    GDN in_proj 的 marlin 收 bf16 激活, Turing 拒: "only support FP16 or INT8
-    activation")。sm80+ model=bf16 且表=bf16 → 返回 bf16, 行为不变。
+    GDN in_proj 的 marlin 收 bf16 激活, 老 CC 拒: "only support FP16 or INT8
+    activation")。高 CC (8.0+) model=bf16 且表=bf16 → 返回 bf16, 行为不变。
     """
     table = self.ngram_embedding.table
     if table is not None and table.torch_dtype in (

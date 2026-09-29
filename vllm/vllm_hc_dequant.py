@@ -18,7 +18,7 @@ weight_shape int64), 但 ``block_inject_weight`` 是 bf16 纯的。decoder 层
 ``Qwen4ExpMTP.load_weights``, 其 HC 是纯 bf16, 不受本 patch 影响)。
 
 为何不压 int8/fp8:
-  * fp8: sm75 (2080Ti) 无 fp8 计算单元, 只能当存储 + 反量化, 纯亏。
+  * fp8: sm75 无 fp8 计算单元, 只能当存储 + 反量化, 纯亏。
   * int8: decoder 融合层 (int8 down + bf16 block_inject 混合) 绕不开 —— 要么 dequant
     down, 要么运行时量化 block_inject (更复杂), 省不了几个百分点。
   * 显存: 主模型 HC down/up 共 97 module × 2×hc_lowrank×hyper_hidden ≈ 0.64GB int8

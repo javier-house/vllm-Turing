@@ -127,12 +127,12 @@ def _resolve_gdn_prefill_backend(
     * ``requested in ["flashinfer", "auto"]``;
     * ``platform == cuda``;
     * one of the following:
-      - Hopper (SM90) — no further constraints;
-      - Blackwell (SM10.x) with ``head_k_dim == 128``, ``cuda_runtime >= 13``.
+      - high-CC (9.0) — no further constraints;
+      - high-CC (10.x) with ``head_k_dim == 128``, ``cuda_runtime >= 13``.
 
     In-tree CuteDSL GDN prefill kernel is chosen when:
     * "cutedsl" is requested; (opt-in only)
-    * Blackwell (SM10.x) with ``head_k_dim == 128``;
+    * high-CC (10.x) with ``head_k_dim == 128``;
 
     Vendored FlashQLA-SM75 is opt-in only. It is selected when
     ``flashqla_sm75`` is requested on exact SM75 with FP16 model weights and

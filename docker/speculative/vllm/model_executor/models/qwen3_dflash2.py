@@ -288,8 +288,8 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
             prefix=prefix,
         )
         draft_config = self.config.dflash_config
-        # Backport the portable TP4 context-FC sharding from 1Cat v1.5.0.
-        # Use the existing SM75 linear implementation, never SM70-only kernels.
+        # 可移植的 TP4 context-FC 切分 (移植自参考实现)。
+        # 用现有 SM75 linear 实现, 不用 SM70 专用 kernel。
         if (
             _use_sm75_bf16_emulation()
             and get_tensor_model_parallel_world_size() == 4

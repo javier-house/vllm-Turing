@@ -2,11 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Range-preserving BF16 arithmetic for DFlash2 drafts on SM70.
 
-The checkpoint was trained with BF16 activations, but Volta executes its dense
-GEMMs in FP16. These kernels retain FP16 Tensor Core transport while preserving
-BF16 residual range and rounding at the model's trained rounding points.
+checkpoint 用 BF16 激活训练, 但 sm70 的稠密 GEMM 走 FP16。这些 kernel 保留
+FP16 Tensor Core 传输, 同时在模型训练舍入点保持 BF16 残差范围与舍入。
 
-Adapted from haohervchb/sglang-V100@5526ef1c6a82.
+移植自参考实现 (sm70 优化版)。
 """
 
 from __future__ import annotations

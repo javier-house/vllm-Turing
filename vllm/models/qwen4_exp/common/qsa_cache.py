@@ -8,7 +8,7 @@
 # 调 split_decodes_and_prefills (只找边界计数, 不物理重排 batch —— decode
 # 在前由 vLLM V1 调度器的 reorder_batch_threshold 机制保证, 模型层 token
 # 顺序与 PLE host-gather buffer 零影响)。
-# 并手工合入我方 sm70/sm75 fp16 放行 2 条 (原 overlay INJECTIONS, 见
+# 并手工合入我方 sm75 fp16 放行 2 条 (原 overlay INJECTIONS, 见
 # QSAStateBackend 与 bind_kv_cache 处注释)。
 """Paged side-cache ownership and metadata for Qwen4Exp QSA.
 
@@ -745,9 +745,9 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
 
 class QSAStateBackend(AttentionBackend):
     # sm75 overlay fp16 放行: QSA 两个 side cache (raw/compressed) 的 dtype
-    # 跟 model_config.dtype (激活 dtype) 走 (见 indexer_qsa.py 注入), sm70/sm75
-    # 模型回退 fp16 → backend 声明 + bind 校验必须放宽 fp16/bf16 (对齐 1Cat
-    # V100+RTX8000 实测)。上游 #54873 仍 bf16-only, 此处手工合入。
+    # 跟 model_config.dtype (激活 dtype) 走 (见 indexer_qsa.py 注入), sm75
+    # 模型回退 fp16 → backend 声明 + bind 校验必须放宽 fp16/bf16 (sm75
+    # 实测)。上游 #54873 仍 bf16-only, 此处手工合入。
     """Key-only dummy backend for out-of-band QSA side-cache operations."""
 
     supported_dtypes: ClassVar[list[torch.dtype]] = [

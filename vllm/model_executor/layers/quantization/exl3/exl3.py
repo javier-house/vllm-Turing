@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vllm project
 """EXL3 (exllamav3 trellis) 在线解码 serving —— sm75 原生实现 (firefly 内核)。
 
-与 vllm-exl3 插件不同: 不用 exllamav3 的 LinearEXL3/cp.async GEMM (sm80-only),
+与第三方 EXL3 插件不同: 不用其 LinearEXL3/cp.async GEMM (需高 CC),
 而是自研 firefly_exl3.cu 的在线解码 kernel (sm75-safe, dp4a/shf/bfe), 输出
 int8 [N, K] + per-channel scale, 直接喂 firefly 的 int8 GEMM (cutlass_scaled_mm,
 sm75 原生 IMMA)。
@@ -105,7 +105,7 @@ def _exl3_int8_resident() -> bool:
 
     EXL3 默认在线解码 (trellis 压缩态常驻, 每 token 现场 decode 全部权重 ->
     O(总权重) 每 step, 27B TP2 仅 ~1.6 tok/s, 解码占 93% 仅 27 GB/s)。若 TP 切得
-    够细 (27B TP4 -> int8 6.75GB/卡 < 11GB 2080Ti), int8 权重可常驻, 每 step 只跑
+    够细 (27B TP4 -> int8 6.75GB/卡 < 11GB 显存), int8 权重可常驻, 每 step 只跑
     M=1 GEMM (免解码, ~18x 提速)。72G MoE 装不下 int8 (24GB/卡), 仍须在线解码。
     判定须 memoize: process_weights_after_loading 逐层调, 随 w_int8 累积 free 下降,
     每调重判会中途翻转 (部分层常驻部分在线)。首调时 free 最大, 是最准的判定点。

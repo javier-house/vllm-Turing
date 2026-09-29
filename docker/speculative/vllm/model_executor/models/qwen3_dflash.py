@@ -581,7 +581,7 @@ class DFlashQwen3Model(nn.Module):
         return normed
 
     def _normalize_context_k_per_layer(self, all_k: torch.Tensor) -> torch.Tensor:
-        # 1Cat v1.5.0 correctness fallback for older stable-ABI extensions.
+        # 旧版 stable-ABI extension 的正确性回退路径。
         all_k_normed = torch.empty_like(all_k)
         for layer_idx in range(all_k.shape[0]):
             ops.rms_norm(

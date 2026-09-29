@@ -71,7 +71,7 @@ class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
 class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):
     """FullAttentionSpec backend used by the merged QSA owner."""
 
-    # sm75 (2080Ti/T10) 无 bf16 计算, 模型回退 f16 → 加 float16 让 backend 选择通过
+    # sm75 无 bf16 计算, 模型回退 f16 → 加 float16 让 backend 选择通过
     # (kernel 对 dtype 无关, 见 Qwen4ExpQSAAttention.__init__ 注释)。
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16, torch.float16]
     # 加 fp8_e4m3: 全局 --kv-cache-dtype fp8_e4m3 时 QSA 主 KV 走 fp8 存储
@@ -183,7 +183,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         # 那会让 QSA kernel 看到 fp8e4nv 张量, sm75 的 Triton 连 .to(tl.float32)
         # 的 cast 都在编译期报 "type fp8e4nv not supported in this architecture"。
         # 改为以 uint8 原样进 kernel, kernel 用 _qsa_fp8e4m3fn_bits_to_fp32 纯位运算
-        # 解码 (对齐 1Cat fp8_software.py)。BF16/FP16 cache (原路径) 不动。
+        # 解码 (uint8 软件解码 fp8_e4m3)。BF16/FP16 cache (原路径) 不动。
         # query 恒为激活 dtype (sm75 回退 f16, 其余 bf16)。
         if query.dtype not in (torch.bfloat16, torch.float16) or key_cache.dtype != value_cache.dtype:
             raise NotImplementedError("Qwen4Exp QSA requires BF16/FP16 query and matching K/V")
@@ -225,13 +225,13 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         model_config = vllm_config.model_config
         if cache_config is None:
             raise ValueError("Qwen4Exp QSA requires a paged KV cache")
-        # sm75 (2080Ti/T10) 无 bf16 计算, vLLM 会把模型回退到 f16; QSA 的 Triton
+        # sm75 无 bf16 计算, vLLM 会把模型回退到 f16; QSA 的 Triton
         # kernel 对 dtype 无关 (tl.dot f16/f16 走 f32 累加, K/V 反量化到激活 dtype),
         # 故 f16/bf16 均放行 (对齐同文件 fp8 cache 处理思路与 GDN 的 f16 回退)。
         if model_config.dtype not in (torch.bfloat16, torch.float16):
             raise NotImplementedError("Qwen4Exp QSA currently requires BF16 or FP16")
         # 允许 fp8_e4m3: 主 KV 走 fp8 存储, 未校准 (checkpoint 无 k/v_scale) →
-        # unit scale + 告警 (对齐 1Cat a286ed5b 语义)。激活仍是 BF16。
+        # unit scale + 告警。激活仍是 BF16。
         if cache_config.cache_dtype not in ("auto", "bfloat16", "fp8_e4m3"):
             raise NotImplementedError("Qwen4Exp QSA requires a BF16 or E4M3 main KV cache")
         if getattr(quant_config, "kv_cache_scheme", None) is not None:
@@ -339,7 +339,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         if self.kv_cache_dtype == "fp8_e4m3":
             # 未校准 (checkpoint 无 k_scale/v_scale): 用 set_default_quant_scales
             # 装的 unit scale (1.0)。E4M3 无 rescale, 绝对值 > 448 的 K/V 会饱和;
-            # 用精度换可启动 (对齐 1Cat a286ed5b 语义)。
+            # 用精度换可启动。
             logger.warning_once(
                 "QSA fp8_e4m3: uncalibrated unit k_scale/v_scale "
                 "(checkpoint has no k/v_scale overlay); K/V with |x| > 448 saturate. "

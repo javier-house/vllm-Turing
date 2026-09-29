@@ -463,7 +463,7 @@ class CustomAllreduce:
     def _use_registered_graph_inputs(self) -> bool:
         """A3(sm75 参考): 决定 capture 时用 registered 快路径还是 staging buffer。
 
-        2080Ti fork 同款: full decode 图走 registered(快); sm75 的 piecewise/
+        sm75 同款: full decode 图走 registered(快); piecewise/
         prefill capture 会分配图私有大 buffer, 无法经 CUDA IPC 导出, 回退
         预注册 staging buffer。auto 按 forward_context.cudagraph_runtime_mode
         判定; 可 VLLM_CUSTOM_ALLREDUCE_GRAPH_INPUT_MODE=registered/staging 覆盖。

@@ -22,7 +22,7 @@ def _qsa_fp8e4m3fn_bits_to_fp32(bits):
     关键: 输入是 uint8 字节而非 float8_e4m3fn 张量。sm75 的 Triton codegen
     只支持 fp8e4b15 / fp8e5, 对 float8_e4m3fn (fp8e4nv) 连 .to(tl.float32)
     的 cast 都在编译期报 "type fp8e4nv not supported in this architecture"。
-    故对齐 1Cat (fp8_software.py) 的做法: K/V cache 按 uint8 物理字节进 kernel,
+    故参考 fp8_software.py 的做法: K/V cache 按 uint8 物理字节进 kernel,
     用 sign/exponent/mantissa 位拆 + tl.exp2 解码 (subnormal: e=0 → m*2^-9;
     normal: (1+m/8)*2^(e-7); NaN: e=15,m=7), 全程不出现 fp8 dtype。
     与 IEEE 直接 cast 数值等价 (E4M3FN 无 inf, 448.0 饱和即 e=15,m=6)。"""
@@ -350,8 +350,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         # 的 cast 都在 sm75 编译期报 "type fp8e4nv not supported"), 而是直接把
         # uint8 物理字节进 kernel (KV_E4M3=True)。kernel 内用 _qsa_fp8e4m3fn_bits_
         # to_fp32 纯位运算 + tl.exp2 解码成 fp32 再降 query 激活 dtype (sm75 fp16 /
-        # sm80+ bf16) 参与 tl.dot, 全程不出现 fp8 dtype。对齐 1Cat (fp8_software.
-        # py 的 fp8_e4m3fn_bits_to_fp32)。E4M3 用 unit scale (未校准 k/v_scale,
+        # 高 CC bf16) 参与 tl.dot, 全程不出现 fp8 dtype。参考 fp8_software.py 的
+        # fp8_e4m3fn_bits_to_fp32 做法。E4M3 用 unit scale (未校准 k/v_scale,
         # 见 ../qsa.py)。非 fp8 (bf16/f16) cache 时 KV_E4M3=False, 直接 .to(query.
         # dtype) (同 dtype 时 no-op), 行为与上游一致。
         if KV_E4M3:
@@ -703,7 +703,7 @@ def qsa_mqa_paged(
     BLOCK_N = 64
     BLOCK_D = max(16, triton.next_power_of_2(q.shape[2]))
     MAX_N = max(16, triton.next_power_of_2(q.shape[1]))
-    # Tuned on GB300: larger row batches provide enough parallelism to reuse Q.
+    # 按上游档调优: 大 row batch 才有足够并行度复用 Q。
     tiles_per_program = 1 if q.shape[0] <= 32 else 8
     _qsa_mqa_paged_kernel[
         (q.shape[0], triton.cdiv(columns, BLOCK_N * tiles_per_program))
@@ -897,7 +897,7 @@ def qsa_sparse_paged_attention(
     logical_indices 是 packed selection buffer: [rows, selection_width + 1],
     尾列是本行有效条目数 (expand kernel 写入, 永不是 token 下标), kernel 读
     它作 tile 循环上界 (移植 v0.30.0)。use_prefill_config 选 prefill 专用
-    tile 档 (大 base_programs 区间, GB300 上 prefill/decode 最优配置分离)。
+    tile 档 (大 base_programs 区间, 上游档上 prefill/decode 最优配置分离)。
     """
 
     if not q.is_cuda or not HAS_TRITON:
@@ -956,8 +956,8 @@ def qsa_sparse_paged_attention(
     # packed buffer 尾列是 valid count, 选区列数 = 宽度 - 1 (kernel 的 TOPK)。
     topk = logical_indices.shape[1] - 1
 
-    # Tuned on GB300 for the Qwen-Air TP1, TP2, and TP4 attention shapes.
-    # Narrow tiles favor decode; wide tiles improve throughput for prefill.
+    # 按上游档对 Qwen-Air TP1/TP2/TP4 attention 形状调优。
+    # 窄 tile 利 decode; 宽 tile 利 prefill 吞吐。
     # 移植 v0.30.0 use_prefill_config: 大 base_programs 区间按 decode/prefill
     # 分档 (capture-stable: FULL-graph 捕获时 max_query_len 是 uniform
     # decode/verify 长度, use_prefill_config 由 max_query_len >
@@ -971,19 +971,19 @@ def qsa_sparse_paged_attention(
     elif base_programs <= 512:
         block_n, target_splits, partial_warps = 64, 4, 2
     else:
-        # 0.30.0 在 GB300 上把大区间 (bp>512) 的 prefill 档从 (64,1,2) 拆出
+        # 0.30.0 把大区间 (bp>512) 的 prefill 档从 (64,1,2) 拆出
         # (32,1,1) prefill 专用档; sm75 的 16 列降档在下方统一处理。
         block_n, target_splits, partial_warps = (
             (32, 1, 1) if use_prefill_config else (64, 1, 2)
         )
-    # Pre-Ampere (sm75/sm70): 64 列 tile 在 HEAD_DIM=256 下超过 Turing 64 KiB
+    # 低 CC (sm75): 64 列 tile 在 HEAD_DIM=256 下超过 sm75 64 KiB
     # shared-memory 上限 (Triton OutOfResources: Required 81920 > limit 65536,
     # kernel 在 SM75 上根本 launch 不了)。prefill (base_programs>256) 选中 64 列
     # profile 即炸, 但 decode (<=small_limit) 是 16 列故 boot profile/cudagraph
-    # 不触发 —— 直到首次真实 prefill (推理期 JIT) 才暴露。对齐 1Cat #441: 降到
-    # 16 列 + 4 warp (64 列 tile 在 V100 上还会串行化 D=256 tensor-core 工作),
+    # 不触发 —— 直到首次真实 prefill (推理期 JIT) 才暴露。降到
+    # 16 列 + 4 warp (64 列 tile 在低 CC 卡上还会串行化 D=256 tensor-core 工作),
     # 在 64..2048 行 prefill 区间实测比此前可跑的最优 profile 快 1.16-2.6x。
-    # sm75 无 bf16 tensor-core 且 shared mem 紧, 32 列 (移植自 0.30.0 的 GB300
+    # sm75 无 bf16 tensor-core 且 shared mem 紧, 32 列 (移植自 0.30.0 的上游
     # prefill 档) 同样未调优, 一并降到 16 列 —— use_prefill_config 的区分在
     # sm75 上被此降档覆盖 (两档都落到 16 列, 仅 warp 数差异, 安全)。
     if not current_platform.has_device_capability(80) and block_n >= 32:

@@ -5,8 +5,8 @@
 # visible_blocks), prefill 保留原逐 query 打分逻辑。#54873 态的 expand kernel
 # 自带 packed 尾列 (TRAILING COUNT COLUMN, output_width+1), 与我方 ops/qsa.py
 # 的 packed 消费者 (selection_width=shape[1]-1) 直接兼容。
-# sm75 降档: 上游 tile 档是 GB300 调的 (prefill TILE_R=64/BLOCK_N=64/
-# K_TILES=16, decode BLOCK_N=64), 2080Ti/T10 (64KB shared 上限, 无 bf16
+# sm75 降档: 上游 tile 档是大显存旗舰卡调的 (prefill TILE_R=64/BLOCK_N=64/
+# K_TILES=16, decode BLOCK_N=64), sm75 (64KB shared 上限, 无 bf16
 # tensor-core) 会 OOM 或串行化, 故在 launch 处按 device capability 降档
 # (见 _decode_block_n / _prefill_logits 的中文注释)。
 """Triton kernels for Qwen4Exp QSA index selection."""
@@ -21,7 +21,7 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
-# GB300 档 decode 块宽; sm75 档见 _decode_block_n()。
+# 上游档 decode 块宽; sm75 档见 _decode_block_n()。
 _DECODE_BLOCK_N = 64
 
 
@@ -283,9 +283,9 @@ def _expand_qsa_indices_kernel(
 
 
 def _decode_block_n() -> int:
-    """decode kernel 的列块宽: GB300 档 64, sm75 档 32。
+    """decode kernel 的列块宽: 上游档 64, sm75 档 32。
 
-    sm75 (2080Ti/T10) 降档算式 —— 本模型 config: indexer_n_heads=4
+    sm75 降档算式 —— 本模型 config: indexer_n_heads=4
     (NUM_HEADS_PADDED=4), indexer_head_dim=128 (BLOCK_D=128),
     DECODE_QUERY_LEN_PADDED=dql_padded (1+投机 token 数, 上界按 8→16 估):
       - keys tile [BLOCK_N, 128] fp16 = BLOCK_N*256 B, STAGES=2 流水双缓冲
@@ -295,7 +295,7 @@ def _decode_block_n() -> int:
       - scores 累加器 [BLOCK_N, N] fp32 占寄存器: =64 时最坏 16 KB / 64 线程
         (num_warps=2) = 每线程 256 B 起步, 加 query/指针/索引逼近 255 寄存器
         上限 → 溢出串行化; =32 时减半 (~8 KB) 安全。
-    合计 shared: BLOCK_N=64 最坏 32+16+流水开销 ≈ 64 KB 顶格 (Turing 单块
+    合计 shared: BLOCK_N=64 最坏 32+16+流水开销 ≈ 64 KB 顶格 (sm75 单块
     上限 64 KB, 对齐 ops/qsa.py 64 列降 16 列的先例); =32 时 ≈ 40 KB, 留足
     余量。TILES_PER_PROG 档位阈值按 program 数分档, BLOCK_N 减半 → program
     数翻倍 → 自动落低一档, 每 program 列跨度不变, 无需另调。
@@ -374,7 +374,7 @@ def warmup_qsa_mqa_paged_decode(
         num_rows = decode_query_len * num_requests
         # q mock 必须与 k_cache mock 同 dtype: 真实 dispatch 里 q 与
         # compressed_key_cache 都是模型 dtype (sm75 fp16), 无 cast 直接进
-        # tl.dot —— 两操作数 dtype 必须一致。上游 #54873 写死 bf16 (GB300
+        # tl.dot —— 两操作数 dtype 必须一致。上游 #54873 写死 bf16 (上游档
         # 巧合正确), 这里改用 k_cache.dtype 跟随实跑 dtype (fp16 模型→fp16)。
         q_ptr = TritonWarmupTensor(
             k_cache.dtype,
@@ -433,19 +433,19 @@ def _prefill_logits(
     logits = torch.empty(
         (num_queries, logits_width), dtype=torch.float32, device=q.device
     )
-    # GB300 档: TILE_R=64/BLOCK_N=64/K_TILES=16。sm75 档降为
+    # 上游档: TILE_R=64/BLOCK_N=64/K_TILES=16。sm75 档降为
     # TILE_R=16/BLOCK_N=32/K_TILES=8, 算式 (num_warps=4 → 128 线程,
     # 本模型 NUM_HEADS_PADDED=4, BLOCK_D=128):
-    #   - scores 累加器 [BLOCK_N, TILE_R*4] fp32: GB300 档 [64,256]=64 KB
+    #   - scores 累加器 [BLOCK_N, TILE_R*4] fp32: 上游档 [64,256]=64 KB
     #     → 每线程 512 B (128 寄存器) 起步, 叠加 query 寄存器必溢出 255
     #     上限; sm75 档 [32,64]=8 KB → 每线程 64 B (16 寄存器) 安全。
-    #   - keys tile [BLOCK_N, 128] fp16 STAGES=2 双缓冲: GB300 32 KB /
-    #     sm75 16 KB; query [128, TILE_R*4] fp16 作 dot B 操作数: GB300
+    #   - keys tile [BLOCK_N, 128] fp16 STAGES=2 双缓冲: 上游 32 KB /
+    #     sm75 16 KB; query [128, TILE_R*4] fp16 作 dot B 操作数: 上游
     #     32 KB / sm75 16 KB → sm75 合计 shared ≈ 32 KB + 流水开销 < 64 KB
-    #     上限 (GB300 档合计 ≈ 64 KB 顶格, 且其 shared 上限 228 KB 本就不紧)。
+    #     上限 (上游档合计 ≈ 64 KB 顶格, 且其 shared 上限 228 KB 本就不紧)。
     #   - grid 维度: 行 tile 数 64→16 升 4 倍, k tile 数 1024→256 升 4 倍,
     #     总 program 数 16 倍, 单 program 工作量 1/8 → 总工作量不变, 换取
-    #     更细并行 (Turing 弱单 CTA 吞吐, 靠多 CTA 填 SM)。
+    #     更细并行 (sm75 弱单 CTA 吞吐, 靠多 CTA 填 SM)。
     if current_platform.has_device_capability(80):
         TILE_R, BLOCK_N, K_TILES = 64, 64, 16
     else:
@@ -525,7 +525,7 @@ def _topk(
 ) -> None:
     # similar dispatch logic as DeepSeek indexer
     block_topk = token_topk // compress_ratio
-    # cooperative_topk 仅 sm90 命中; sm75 走 persistent_topk (上游自带分派)。
+    # cooperative_topk 仅高 CC (9.0+) 命中; sm75 走 persistent_topk (上游自带分派)。
     use_cooperative_topk = (
         logits.shape[0] <= 64
         and logits.stride(0) % 4 == 0

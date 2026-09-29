@@ -108,7 +108,7 @@ INJECTIONS: list[tuple[str, list[tuple[str, str, str]]]] = [
         )],
     ),
     (
-        # PLE(ngram) 大表 NVMe mmap 需要 PP>1 (8 卡 2080Ti 只能 PP4×TP2 用满)。
+        # PLE(ngram) 大表 NVMe mmap 需要 PP>1 (8 卡 sm75 只能 PP4×TP2 用满)。
         # 上游 Qwen4ExpForConditionalGenerationConfig.verify_and_update_config 对
         # "有 ple_layer_ids 且 PP>1" 一律抛 NotImplementedError(理由: 非首 PP rank
         # 收不到 PLE 的 raw input_ids)。但该检查过严: 只有当某个 PLE 层落在
@@ -144,13 +144,13 @@ INJECTIONS: list[tuple[str, list[tuple[str, str, str]]]] = [
         )],
     ),
     (
-        # QSA 索引侧 (indexer_qsa.py) 的 sm70/sm75 fp16 放行 —— 同目录 qsa.py 的
+        # QSA 索引侧 (indexer_qsa.py) 的 sm75 fp16 放行 —— 同目录 qsa.py 的
         # fp16/fp8 兼容是整文件覆盖 (见 files 列表), 但 QSAIndexer 在姊妹文件
         # indexer_qsa.py, 不在 files 列表里, 上游仍是 bf16-only:
         #   (1) model_config.dtype != bf16 → raise "Qwen4Exp QSA currently requires BF16"
         #   (2) raw_key_cache / compressed_key_cache 硬编码 dtype=bf16
-        # sm75 (2080Ti) / sm70 (V100) 无 bf16 计算, 模型回退 fp16 → 第 (1) 条炸,
-        # 且 bf16 侧 cache 与 fp16 激活不一致。对齐 1Cat (V100+RTX8000 sm70/sm75):
+        # sm75 无 bf16 计算, 模型回退 fp16 → 第 (1) 条炸,
+        # 且 bf16 侧 cache 与 fp16 激活不一致。(sm75 实测):
         # 校验放宽 fp16/bf16, 两个 QSA side cache 的 dtype 跟 model_config.dtype
         # (激活 dtype) 一致 (K 是激活 dtype, 侧 cache 应同 dtype)。增量锚点注入,
         # 上游正文不整文件覆盖。
@@ -326,11 +326,11 @@ INJECTIONS: list[tuple[str, list[tuple[str, str, str]]]] = [
         ],
     ),
     (
-        # HyperConnection 层 params_dtype 跟激活 dtype 一致 (sm70/sm75 fp16 放行)。
+        # HyperConnection 层 params_dtype 跟激活 dtype 一致 (sm75 fp16 放行)。
         # 上游 model.py 两处 (decoder layer 260 / Qwen4ExpModel 436) + mtp.py 229
-        # 硬编码 params_dtype=bf16: sm75/sm70 模型回退 fp16 时, HC 层参数仍 bf16
+        # 硬编码 params_dtype=bf16: sm75 模型回退 fp16 时, HC 层参数仍 bf16
         # 会与其余 fp16 层 dtype 不一致 (GEMM/累加 dtype mismatch)。改成
-        # model_config.dtype (对齐 1Cat)。两处缩进不同 (8/12 空格) 可作独立 anchor。
+        # model_config.dtype。两处缩进不同 (8/12 空格) 可作独立 anchor。
         "models/qwen4_exp/nvidia/model.py",
         [
             (
@@ -748,6 +748,148 @@ INJECTIONS: list[tuple[str, list[tuple[str, str, str]]]] = [
             "qwen4_exp_qsa_triton_warmup(worker)",
         )],
     ),
+    (
+        # firefly deferred-recv (VLLM_FIREFLY_DEFER): PP>1 非首 stage 把 irecv 从
+        # execute_model 入口推迟到 forward 前, 让 host 准备与上一 stage GPU 计算
+        # 重叠。三处注入: ①模块级插 DeferredRecvIntermediateTensors 子类 +
+        # _defer_pp_recv helper(紧挨 AsyncIntermediateTensors 之后, class Worker
+        # 之前); ②recv 分支加 deferred if / 原逻辑转 elif; ③execute_model 后补
+        # wait_for_comm(没人读 .tensors 时也要与上一 rank send 配对)。设备操作
+        # 顺序不变(recv→forward→send), 数值逐 bit 一致; PP1(TP8)恒 is_first_rank
+        # 不进分支 = no-op。纯 host 调度顺序, 不改编译图(envs_sm75 里 pop)。
+        "v1/worker/gpu_worker.py",
+        [
+            (
+                # ① 子类 + helper 插到 class Worker 定义之前。
+                "class Worker(WorkerBase):\n",
+                'class DeferredRecvIntermediateTensors(AsyncIntermediateTensors):\n'
+                '    """firefly deferred-recv: 把 PP 非首 stage 的 irecv 推迟到 forward 前。\n'
+                '\n'
+                '    irecv_tensor_dict 第一步是 CPU group 上阻塞收 pickled metadata, 而它\n'
+                '    只有上一 PP stage launch 完 forward 后才发。在 execute_model 入口就调\n'
+                '    它, 会让本 rank 的输入/attention-metadata host 准备全卡在"等上一 rank\n'
+                '    launch"之后; 当 per-rank GPU 时间短(decode)时这段 host 活就成了 step\n'
+                '    时长。model runner 只在 forward 前读 .tensors, 故把 irecv 推迟到那时\n'
+                '    发 —— 本 rank 设备操作顺序不变(recv→forward→send), 数值逐 bit 一致。\n'
+                '    见 VLLM_FIREFLY_DEFER / install_sm75_overlay.py。\n'
+                '    """\n'
+                '\n'
+                '    def __init__(self, recv: Callable[[], tuple]) -> None:\n'
+                '        super().__init__({})\n'
+                '        self._recv = recv\n'
+                '\n'
+                '    def wait_for_comm(self) -> None:\n'
+                '        if object.__getattribute__(self, "_comm_waited"):\n'
+                '            return\n'
+                '        tensor_dict, handles, postprocess = object.__getattribute__(\n'
+                '            self, "_recv"\n'
+                '        )()\n'
+                '        assert tensor_dict is not None\n'
+                '        object.__setattr__(self, "tensors", tensor_dict)\n'
+                '        object.__setattr__(self, "_comm_handles", handles)\n'
+                '        object.__setattr__(self, "_comm_postprocess", postprocess)\n'
+                '        super().wait_for_comm()\n'
+                '\n'
+                '\n'
+                'def _defer_pp_recv() -> bool:\n'
+                '    """firefly deferred-recv 开关: VLLM_FIREFLY_DEFER, auto 跟随总开关。"""\n'
+                '    return envs.VLLM_FIREFLY_DEFER\n'
+                '\n'
+                '\n'
+                'class Worker(WorkerBase):\n',
+                'class DeferredRecvIntermediateTensors(AsyncIntermediateTensors):',
+            ),
+            (
+                # ② recv: deferred 分支优先(v2 runner + 开关), 原逻辑转 elif 回退。
+                '        if forward_pass and not get_pp_group().is_first_rank:\n'
+                '            tensor_dict, comm_handles, comm_postprocess = (\n'
+                '                get_pp_group().irecv_tensor_dict(\n'
+                '                    all_gather_group=get_tp_group(),\n'
+                '                    all_gather_tensors=all_gather_tensors,\n'
+                '                )\n'
+                '            )\n'
+                '            assert tensor_dict is not None\n'
+                '            intermediate_tensors = AsyncIntermediateTensors(\n'
+                '                tensor_dict,\n'
+                '                comm_handles=comm_handles,\n'
+                '                comm_postprocess=comm_postprocess,\n'
+                '            )\n',
+                '        if (\n'
+                '            forward_pass\n'
+                '            and not get_pp_group().is_first_rank\n'
+                '            and self.use_v2_model_runner\n'
+                '            and _defer_pp_recv()\n'
+                '        ):\n'
+                '            # firefly deferred-recv: 此处只挂一个"到 forward 前才发\n'
+                '            # irecv"的回调, 不在入口阻塞收 metadata。\n'
+                '            pp_group, tp_group = get_pp_group(), get_tp_group()\n'
+                '            intermediate_tensors = DeferredRecvIntermediateTensors(\n'
+                '                lambda: pp_group.irecv_tensor_dict(\n'
+                '                    all_gather_group=tp_group,\n'
+                '                    all_gather_tensors=all_gather_tensors,\n'
+                '                )\n'
+                '            )\n'
+                '        elif forward_pass and not get_pp_group().is_first_rank:\n'
+                '            tensor_dict, comm_handles, comm_postprocess = (\n'
+                '                get_pp_group().irecv_tensor_dict(\n'
+                '                    all_gather_group=get_tp_group(),\n'
+                '                    all_gather_tensors=all_gather_tensors,\n'
+                '                )\n'
+                '            )\n'
+                '            assert tensor_dict is not None\n'
+                '            intermediate_tensors = AsyncIntermediateTensors(\n'
+                '                tensor_dict,\n'
+                '                comm_handles=comm_handles,\n'
+                '                comm_postprocess=comm_postprocess,\n'
+                '            )\n',
+                'intermediate_tensors = DeferredRecvIntermediateTensors(',
+            ),
+            (
+                # ③ execute_model 后: 没人读 .tensors 也补一次 irecv, 与上一 rank send 配对。
+                '            output = self.model_runner.execute_model(\n'
+                '                scheduler_output, intermediate_tensors\n'
+                '            )\n',
+                '            output = self.model_runner.execute_model(\n'
+                '                scheduler_output, intermediate_tensors\n'
+                '            )\n'
+                '            if isinstance(intermediate_tensors, DeferredRecvIntermediateTensors):\n'
+                '                # firefly deferred-recv: 即便没人读 .tensors, 也要补发\n'
+                '                # irecv 与上一 rank 的 send 配对(否则 P2P 挂起/下步错位)。\n'
+                '                intermediate_tensors.wait_for_comm()\n',
+                'isinstance(intermediate_tensors, DeferredRecvIntermediateTensors)',
+            ),
+        ],
+    ),
+    (
+        # mamba grid 解耦: align 模式尊重显式 --mamba-block-size, 不再重置成
+        # KV block_size。inert (2026-09-29 实测): v0.29.0 align 模式 mamba 常驻
+        # 内存是固定滑动窗口 max_memory = page*(2+spec+prefill), 与 mbs 无关
+        # (前面状态被 remove_skipped_blocks 回收), 放大 grid 不省 KV 显存
+        # (TP8 262144 实测 375688 tokens 不变)。容量收益仅 all 模式 (关 prefix
+        # cache, 逐 token 存检查点) 才存在, 当前未用。保留: all 模式预留 +
+        # 语义正确。inert: 不传 flag 走原重置路径, 其他模型零影响。
+        # 约束: grid 须是 block_size 整数倍, 否则 prefix 长度无法同时 block/
+        # grid 对齐 → prefix cache 命中归零, 故 assert。
+        "platforms/interface.py",
+        [(
+            '        if cache_config.mamba_cache_mode == "align":\n'
+            '            cache_config.mamba_block_size = cache_config.block_size\n',
+            '        if cache_config.mamba_cache_mode == "align":\n'
+            '            if cache_config.user_specified_mamba_block_size:\n'
+            '                # 显式 --mamba-block-size 是循环状态检查点 grid, 不是 KV\n'
+            '                # page 倍数: 保留它而不是强制等于 KV block size。须为\n'
+            '                # block size 整数倍, 否则 prefix 长度无法同时 block/\n'
+            '                # grid 对齐 → prefix cache 命中归零。\n'
+            '                grid = cache_config.mamba_block_size\n'
+            '                assert grid is not None and grid % cache_config.block_size == 0, (\n'
+            '                    "--mamba-block-size must be a multiple of --block-size in "\n'
+            '                    f"align mode, got {grid} and {cache_config.block_size}"\n'
+            '                )\n'
+            '            else:\n'
+            '                cache_config.mamba_block_size = cache_config.block_size\n',
+            'grid = cache_config.mamba_block_size',
+        )],
+    ),
 ]
 
 
@@ -888,7 +1030,7 @@ def main() -> None:
     # Qwen4ExpMultiTokenPredictor 类定义之后、实例化之前触发 maybe_apply (打 patch)。
     # 与 PLE hook 同手法 (尾部 append + marker 判幂等)。PP>1 + MTP 时草稿头只会在末
     # rank 跑, 但 forward 拿目标模型的 pp 位置分支 → 末 rank 炸 assert; patch 删掉
-    # 两个 PP 分支 (对齐 1Cat 26a406ab)。patch 类属性 forward 对 @support_torch_compile
+    # 两个 PP 分支。patch 类属性 forward 对 @support_torch_compile
     # 的编译路径生效 (wrapper.py:127 在实例构造期捕获 self.forward=类属性, 见
     # vllm_mtp_stage_local.py 模块 docstring 的证据)。文件不存在 (底座没带模型) 跳过。
     mtp_file = package_root / "models/qwen4_exp/nvidia/mtp.py"

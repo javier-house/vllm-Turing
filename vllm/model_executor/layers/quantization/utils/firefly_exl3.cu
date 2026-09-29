@@ -277,7 +277,7 @@ __device__ __forceinline__ void exl3_had_tile(
 
   // s_mem 复用: 阶段1/2 当 s_packed (uint32 视图), 行 Hadamard 后 (QUANT) 当量化
   // 暂存 s_stage。二者不共存 (rr 循环前有 __syncthreads, 阶段1/2 必完成), 用一段
-  // __shared__ uint8 + 类型别名复用 (不新增 smem)。2080Ti (sm75) 每 block 默认
+  // __shared__ uint8 + 类型别名复用 (不新增 smem)。sm75 每 block 默认
   // smem 48KB, 取 max(s_packed, s_stage) 与 stile(16KB) 合计 ~32.5KB, 放得下。
   //
   // s_packed 布局 (原 3 维 [8][8][packed_size/2] uint32): tile (j,wn) 的 flat
@@ -422,7 +422,7 @@ __device__ __forceinline__ void exl3_had_tile(
       // c_n 加载时算好(整列 amax/127)。
       // 关键 (decode 提速): 不能直接 4 个 1 字节全局散写 —— lane l 写 n=4l..4l+3,
       // 相邻 lane 地址差 4*K 字节, 一个 warp 128 字节打散进 128 个 128B sector
-      // (写放大 ~32x), 实测整 kernel 仅 27 GB/s (2080Ti 峰值 ~548)。改为:
+      // (写放大 ~32x), 实测整 kernel 仅 27 GB/s (sm75 峰值 ~548)。改为:
       // 4 字节打包成 uint32 存 shared [k_local=R][n_local=4l..4l+3]
       // (word bank = R*32+l mod 32 = l, 冲突-free), 行 Hadamard 循环结束后
       // 全 block __syncthreads, 再整块 16B int4 合并 flush 到 out_int8[n*K+k]。

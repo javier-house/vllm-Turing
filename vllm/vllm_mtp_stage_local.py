@@ -23,7 +23,7 @@
   * ``if not get_pp_group().is_last_rank:`` 末 rank 上为 False, 单 rank 上两者都
     True, 被删分支本就是 dead path。
 
-修法 (对齐 1Cat 26a406ab): 草稿头 forward 删掉两个 PP 分支 —— 永远本地建 embedding
+修法: 草稿头 forward 删掉两个 PP 分支 —— 永远本地建 embedding
 (去掉 is_first_rank 分支), 永远本地收尾 (去掉 not is_last_rank 分支, 不再向下传
 IntermediateTensors)。单 rank 行为不变 (那里 is_first/is_last 都 True)。
 
@@ -73,8 +73,8 @@ def _stage_local_forward(
 
     参数名/顺序与上游 ``Qwen4ExpMultiTokenPredictor.forward`` 完全一致 (``Qwen4ExpMTP.
     forward`` 按位置传参, ``_mark_dynamic_inputs`` 按名 bind dynamic_arg_dims), 切勿改。
-    ``intermediate_tensors`` 保留在签名但**不使用** (对齐 1Cat 26a406ab: 草稿头无人
-    送 IntermediateTensors, 删掉 is_first_rank 分支后它本就是 dead 输入)。
+    ``intermediate_tensors`` 保留在签名但**不使用** (草稿头无人送 IntermediateTensors,
+    删掉 is_first_rank 分支后它本就是 dead 输入)。
     """
     hc_count = self.hc_count
     hidden_size = self.hidden_size
