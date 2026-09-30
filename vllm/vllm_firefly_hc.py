@@ -34,6 +34,12 @@ from __future__ import annotations
 import logging
 import os
 
+# torch 必须在模块作用域 import: 本文件用 `from __future__ import annotations`,
+# custom_op ``hc_gemv`` 的注解 (torch.Tensor) 是惰性字符串, vllm 的 infer_schema 运行时
+# 要在模块 globals 解析它; 若只在 _get_hc_gemv() 函数内 import torch, 解析时
+# `name 'torch' is not defined` → 启动崩。triton 仍保持函数内懒加载。
+import torch
+
 logger = logging.getLogger("vllm.firefly_hc")
 
 # HC 三投影模块名 (对齐底座 GatedResidual 属性名)。

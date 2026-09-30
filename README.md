@@ -55,7 +55,7 @@ wheel 按镜像的 Python 3.12 下载，与构建机自身 Python 版本无关�
 
 ### 3. 启动
 
-用 `docker run` 启动：镜像名 `vllm-turing` 后接模型与启动参数。容器入口（entrypoint）默认**不更新**——直接用镜像内置代码，普通运行不受拉取影响；需要拉取最新 `vllm-Turing` 并重新 overlay 时加 `-e VLLM_TURING_UPDATE=1`（示例 A/B）。先设置：
+用 `docker run` 启动：镜像名 `vllm-turing` 后接模型与启动参数。容器入口（entrypoint）默认**不更新**——直接用镜像内置代码，普通运行不受拉取影响；需要拉取最新 `vllm-Turing` 并重新 overlay 时加 `-e VLLM_TURING_UPDATE=1`（示例 A/B）。更多启动命令参考 `docs/`（按模型分子目录，如 `docs/Qwen/Qwen3.8-Flash-Next/start_w4a16_tp8.sh`）。先设置：
 
 ```bash
 export VLLM_API_KEY='replace-with-your-api-key'
