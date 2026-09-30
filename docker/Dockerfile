@@ -13,11 +13,17 @@
 ARG BASE_IMAGE=vllm/vllm-openai:v0.30.0-cu129@sha256:a67f8f186d4567612ac37a55bd82295006002b18858eb12a8af2f05f86c2ae3f
 
 # 1) 预编译 flash_qla GDN prefill .so(独立 build stage, 稳定内核, nvcc 慢, 编一次进镜像)
-#    只依赖 base 镜像里的 torch, 不需要 flashinfer, 故直接 FROM base。
+#    只依赖 torch, 不需要 flashinfer, 故直接 FROM base。
+#    torch ABI 必须与 runtime 层一致: 底座自带 torch 被单独升到 2.14.0+cu130, 但 runtime
+#    层降回 2.13.0+cu129(见下方 torch 家族对齐)。C10_CUDA_CHECK 宏展开引用 c10::cuda::
+#    CUDAErrorLogCapture(2.14 才有), 若 builder 仍按 2.14 编译, .so 链接 2.14 符号, 运行时
+#    dlopen 报 undefined symbol。故 builder 同步降到 2.13.0+cu129 再编。
 FROM ${BASE_IMAGE} AS flashqla-builder
 ENV TORCH_CUDA_ARCH_LIST=7.5
 ARG MAX_JOBS=1
 ENV MAX_JOBS=${MAX_JOBS}
+RUN uv pip install --system --no-cache "torch==2.13.0" \
+    --index-url https://download.pytorch.org/whl/cu129
 WORKDIR /opt/flashqla-build
 COPY vllm/third_party/flash_qla_sm75 /opt/flashqla-build/source
 RUN python3 /opt/flashqla-build/source/build_extension.py \
@@ -30,6 +36,10 @@ RUN python3 /opt/flashqla-build/source/build_extension.py \
 
 # 2) runtime: 整个项目(含 docker/tmp 预下载 wheel) + 依赖(离线优先) + 工具 + 预编译 .so + 构建期 overlay + 校验
 FROM ${BASE_IMAGE} AS runtime
+# apt 源换阿里云: 官方 ubuntu 源在境内偶发 Hash Sum mismatch(CDN 节点同步窗口不一致),
+# 换国内镜像源规避; deb822 格式 (noble) 改 /etc/apt/sources.list.d/ubuntu.sources 的 URIs。
+RUN sed -i "s\|archive.ubuntu.com\|mirrors.aliyun.com\|g; s\|security.ubuntu.com\|mirrors.aliyun.com\|g" \
+    /etc/apt/sources.list.d/ubuntu.sources || true
 # git: entrypoint 挂载模式/离线 fallback 判 overlay 源状态需要它(base 镜像原本没有,
 # 缺失时 entrypoint 直接跳过重新 overlay, 分支修复无法在运行时生效)。
 RUN set -eux; \
@@ -64,6 +74,14 @@ RUN set -eux; \
       echo "[deps] docker/tmp 缺 transformers wheel, 在线安装"; \
       uv pip install --system transformers==5.15.1; \
     fi; \
+    # 修复官方 v0.30.0-cu129 底座自带坑: 发布时 torch 被单独升到 2.14.0+cu130
+    # (镜像 label buildkite #7022), 但 torchvision=0.28.0+cu129 / torchaudio=2.11.0+cu129
+    # 仍留旧版, torch 家族 ABI 不配对 → import torchvision 即崩
+    # (operator torchvision::nms does not exist) → transformers import 链全挂。
+    # 与上游 requirements/cuda.txt (torch==2.13.0) 对齐, 把 torch 降回 cu129 套,
+    # 与既有 torchvision/torchaudio 全一致 (triton 3.8→3.7.1 随之回退, 官方配套)。
+    uv pip install --system --no-cache "torch==2.13.0" \
+        --index-url https://download.pytorch.org/whl/cu129; \
     rm -rf "$W"
 
 ARG BUILD_DATE

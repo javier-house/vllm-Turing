@@ -708,6 +708,11 @@ class _MmapNgramEmbedding(nn.Module):
     ``_dequantize_embeddings`` 对非 FP8 也不碰 ``weight_scale`` (走 None 分支)。
     """
 
+    # v0.30 上游用 supports_prefetch 分流 PLE forward: True 走 UVA prefetch
+    # 通路 (PinnedHost), False 走 ngram_ids 普通 gather 通路。占位 forward 收
+    # ngram_ids, 即 False 通路 (对齐上游基类 Qwen4ExpPLEEmbedding 默认值)。
+    supports_prefetch: bool = False
+
     def __init__(self, num_embeddings: int, embedding_dim: int, **kw) -> None:
         # v0.30 起上游以 embedding_method / params_dtype / padding_size / prefix /
         # num_ngram_heads / max_total_tokens / data_parallel_rank 等 kw 调用本占位

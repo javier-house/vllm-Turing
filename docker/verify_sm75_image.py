@@ -38,7 +38,7 @@ def main() -> None:
     if torch.version.cuda != "12.9":
         raise RuntimeError(f"Expected CUDA 12.9, found {torch.version.cuda}")
 
-    from vllm.config.model import _normalize_config_dtype
+    from vllm.config.model import str_dtype_to_torch_dtype
     from vllm.entrypoints.serve.utils.api_utils import redact_sensitive_args
 
     redacted = redact_sensitive_args(
@@ -50,7 +50,7 @@ def main() -> None:
         "model": "ok",
     }:
         raise RuntimeError(f"Sensitive argument redaction failed: {redacted}")
-    if _normalize_config_dtype("float16") is not torch.float16:
+    if str_dtype_to_torch_dtype("float16") is not torch.float16:
         raise RuntimeError("String HF dtype override was not normalized")
 
     from vllm.v1.engine.auto_sleep import AutoSleepConfig, AutoSleepController
