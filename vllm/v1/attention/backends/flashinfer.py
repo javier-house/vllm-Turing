@@ -1398,7 +1398,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         needs_seq_lens_cpu = self.use_dcp or use_cascade or not all_uses_trtllm
         if needs_seq_lens_cpu:
             with gpu_sync_allowed():
-                seq_lens_cpu = common_attn_metadata.seq_lens_cpu
+                # v0.30.0: seq_lens_cpu 字段已从 CommonAttentionMetadata 移除,
+                # 改由 GPU 侧 seq_lens 现算 (对齐上游 flashinfer.py)
+                seq_lens_cpu = common_attn_metadata.seq_lens.cpu()
             seq_lens_np = seq_lens_cpu.numpy()
             num_blocks_np = (seq_lens_np + (page_size - 1)) // page_size
         else:
