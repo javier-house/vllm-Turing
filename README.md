@@ -158,7 +158,6 @@ MTP5 / DFlash2 复用上面同一个 `docker run` 命令，仅替换模型并把
   --speculative-config '{"method":"mtp","num_speculative_tokens":5}' \
   --scheduler-cls vllm.v1.core.sched.scheduler_sm75.SM75Scheduler
 # DFlash2：先把匹配 draft 下载到自选目录并挂到 /models，再追加
-  --kv-cache-memory-bytes 3288334336 \
   --speculative-config '{"method":"dflash","model":"/models/Qwen3.8-27B-DFlash2","num_speculative_tokens":7,"draft_tensor_parallel_size":4,"max_model_len":262144,"kv_cache_dtype":"auto","attention_backend":"FLASHINFER","draft_sample_method":"probabilistic"}' \
   --scheduler-cls vllm.v1.core.sched.scheduler_sm75.SM75Scheduler
 ```
