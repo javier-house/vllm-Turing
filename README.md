@@ -81,6 +81,7 @@ docker run -d --name vllm-turing-fp8 --gpus all --shm-size 16g \
   --served-model-name VLLM-Qwen3.8-27B --host 0.0.0.0 --port 8000 --api-key "$VLLM_API_KEY" \
   --tensor-parallel-size 4 --disable-custom-all-reduce \
   --max-num-seqs 4 --max-num-batched-tokens 8192 \
+  --long-prefill-token-threshold 4096 \
   --gpu-memory-utilization 0.87 --max-model-len auto \
   --attention-config '{"backend":"FLASHINFER"}' --gdn-prefill-backend flashqla_sm75 \
   --kv-cache-dtype fp8_e4m3 --block-size 32 --dtype float16 \
@@ -107,6 +108,7 @@ docker run -d --name vllm-turing-fp8 --gpus all --shm-size 16g \
   --served-model-name VLLM-Qwen3.8-27B --host 0.0.0.0 --port 8000 --api-key "$VLLM_API_KEY" \
   --tensor-parallel-size 4 --disable-custom-all-reduce \
   --max-num-seqs 4 --max-num-batched-tokens 8192 \
+  --long-prefill-token-threshold 4096 \
   --gpu-memory-utilization 0.87 --max-model-len auto \
   --attention-config '{"backend":"FLASHINFER"}' --gdn-prefill-backend flashqla_sm75 \
   --kv-cache-dtype fp8_e4m3 --block-size 32 --dtype float16 \
@@ -134,6 +136,7 @@ docker run -d --name vllm-turing-fp8 --gpus all --shm-size 16g \
   --served-model-name VLLM-Qwen3.8-27B --host 0.0.0.0 --port 8000 --api-key "$VLLM_API_KEY" \
   --tensor-parallel-size 4 --disable-custom-all-reduce \
   --max-num-seqs 4 --max-num-batched-tokens 8192 \
+  --long-prefill-token-threshold 4096 \
   --gpu-memory-utilization 0.87 --max-model-len auto \
   --attention-config '{"backend":"FLASHINFER"}' --gdn-prefill-backend flashqla_sm75 \
   --kv-cache-dtype fp8_e4m3 --block-size 32 --dtype float16 \
@@ -143,6 +146,8 @@ docker run -d --name vllm-turing-fp8 --gpus all --shm-size 16g \
   --kv-transfer-config '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":8589934592}}' \
   --auto-sleep-idle-timeout 30 --auto-sleep-offload-target exit
 ```
+
+`--long-prefill-token-threshold N`：限制单个请求一个 step 内最多消化的 prefill token 数（chunked prefill 下生效），用来压住"超长 prompt 一步吃满整个 batch、把同批 decode 请求的输出间隔拖长"。取值须明显小于 `--max-num-batched-tokens` 才有效。副作用是长 prompt 的首字延迟（TTFT）变高、prefill 总时间变长；对本项目的 27B 模型无 firefly 顾虑——firefly int8 prefill 在 27B 上的交叉点 M\*<561，切到 2048~4096 的 chunk 仍远在收益区内。
 
 FP8 默认通过 ModelScope 加载 `Qwen/Qwen3.8-27B-FP8`，示例已配置监听地址、端口、API key 和持久化挂载。使用相同 GPU 的模式按需互斥启动，容器需手动重建（不会自动替换同名容器）。
 
