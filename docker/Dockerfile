@@ -74,6 +74,10 @@ RUN set -eux; \
       echo "[deps] docker/tmp 缺 transformers wheel, 在线安装"; \
       uv pip install --system transformers==5.15.1; \
     fi; \
+    # 离线 --no-deps 不会触发依赖解析降级: 0.30 底座自带 tokenizers==0.23.2,
+    # 而 transformers 5.15.1 要求 tokenizers>=0.22.0,<=0.23.0, 不显式降会在
+    # verify import transformers 时 ImportError。固定到 0.22.2(与在线路径一致)。
+    uv pip install --system --no-cache "tokenizers==0.22.2"; \
     # 修复官方 v0.30.0-cu129 底座自带坑: 发布时 torch 被单独升到 2.14.0+cu130
     # (镜像 label buildkite #7022), 但 torchvision=0.28.0+cu129 / torchaudio=2.11.0+cu129
     # 仍留旧版, torch 家族 ABI 不配对 → import torchvision 即崩

@@ -13,8 +13,8 @@ import torch
 
 EXPECTED_PACKAGES = {
     "vllm": "0.30.0",
-    "flashinfer-python": "0.6.18",
-    "flashinfer-cubin": "0.6.18",
+    "flashinfer-python": "0.7.0",
+    "flashinfer-cubin": "0.7.0",
     "transformers": "5.15.1",
 }
 
