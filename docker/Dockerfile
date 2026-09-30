@@ -50,19 +50,19 @@ RUN set -eux; \
 # 注意 .dockerignore 不再排除 /.git: 镜像自带完整仓库, 未挂载时 entrypoint 可直接
 # 以镜像内 /vllm-Turing 为 overlay 源判断(见 entrypoint.sh)。
 COPY . /vllm-Turing
-# flashinfer 0.6.18 + transformers 5.15.1: docker/tmp/wheels 里有对应 wheel 就离线安装,
-# 缺则在线下载。去 flashinfer-jit-cache: 无 SM75 AOT cubin, 会挂 CUDA graph warmup。
-# 注意: wheel 必须匹配镜像的 Python(3.12)/平台(manylinux x86_64), 由 prefetch_deps.sh 按此下载。
+
 RUN set -eux; \
     W=/vllm-Turing/docker/tmp/wheels; \
-    fi_py="$(ls "$W"/flashinfer_python-0.6.18-*.whl 2>/dev/null || true)"; \
-    fi_cu="$(ls "$W"/flashinfer_cubin-0.6.18-*.whl 2>/dev/null || true)"; \
-    if [ -n "$fi_py" ] && [ -n "$fi_cu" ]; then \
-      echo "[deps] 离线安装 flashinfer (来自 $W)"; \
-      uv pip install --system --no-cache --no-deps "$fi_py" "$fi_cu"; \
+    fi_py="$(ls "$W"/flashinfer_python-0.7.0-*.whl 2>/dev/null || true)"; \
+    fi_cu="$(ls "$W"/flashinfer_cubin-0.7.0-*.whl 2>/dev/null || true)"; \
+    nccl_ext="$(ls "$W"/nccl_extensions-0.1.0-*.whl 2>/dev/null || true)"; \
+    if [ -n "$fi_py" ] && [ -n "$fi_cu" ] && [ -n "$nccl_ext" ]; then \
+      echo "[deps] 离线安装 flashinfer 0.7.0 + nccl-extensions (来自 $W)"; \
+      uv pip install --system --no-cache --no-deps "$fi_py" "$fi_cu" "$nccl_ext"; \
     else \
       echo "[deps] docker/tmp 缺 flashinfer wheel, 在线安装"; \
-      uv pip install --system --no-cache --no-deps flashinfer-python==0.6.18 flashinfer-cubin==0.6.18 \
+      uv pip install --system --no-cache --no-deps \
+          flashinfer-python==0.7.0 flashinfer-cubin==0.7.0 nccl-extensions==0.1.0 \
           --extra-index-url https://flashinfer.ai/whl/; \
     fi; \
     uv pip uninstall --system flashinfer-jit-cache || true; \
