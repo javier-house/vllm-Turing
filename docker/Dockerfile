@@ -92,7 +92,7 @@ ARG BUILD_DATE
 ARG SOURCE_REVISION
 ARG BASE_IMAGE_ID
 ARG VLLM_SM75_RELEASE=vllm-turing
-ARG UPSTREAM_VLLM_COMMIT=98dff2a81d747d1dba01a47f939f48c3526d4206
+ARG UPSTREAM_VLLM_COMMIT=ced6857afa0ea7b2e3f0846a62e1394e90f15607
 ARG ONECAT_FLASHQLA_COMMIT=187b932dbd11940f0bcf52fb3675dd47fd69f313
 LABEL org.opencontainers.image.created="${BUILD_DATE}" \
       org.opencontainers.image.revision="${SOURCE_REVISION}" \
@@ -101,7 +101,7 @@ LABEL org.opencontainers.image.created="${BUILD_DATE}" \
       org.opencontainers.image.title="vLLM-Turing" \
       org.opencontainers.image.description="vLLM-Turing: base image + whole project; entrypoint pulls and re-applies overlay" \
       ai.vllm.upstream.commit="${UPSTREAM_VLLM_COMMIT}" \
-      ai.vllm.upstream.version="0.29.0" \
+      ai.vllm.upstream.version="0.30.0" \
       ai.vllm.sm75.source-revision="${SOURCE_REVISION}" \
       ai.vllm.flashqla.commit="${ONECAT_FLASHQLA_COMMIT}" \
       ai.vllm.sm75.release="${VLLM_SM75_RELEASE}"
