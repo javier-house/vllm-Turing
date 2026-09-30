@@ -26,7 +26,8 @@ PYPY_MIRRORS=(
 )
 FI_EXTRA="https://flashinfer.ai/whl/"
 # flashinfer 版本固定(与 Dockerfile 一致)
-FI_VERSION="0.6.18"
+FI_VERSION="0.7.0"
+NCCL_EXT_VERSION="0.1.0"
 TF_VERSION="5.15.1"
 
 log() { echo "[prefetch] $*" >&2; }
@@ -76,6 +77,14 @@ if ls "$WHEELS_DIR"/flashinfer_python-${FI_VERSION}-*.whl >/dev/null 2>&1; then
 else
   fetch "flashinfer-python" "flashinfer-python==${FI_VERSION}" --extra-index-url "$FI_EXTRA" \
     || { log "  flashinfer-python 下载失败(构建时将在线兜底)"; status=1; }
+fi
+
+# nccl-extensions(flashinfer 0.7.0 硬依赖, manylinux cp312, PyPI)
+if ls "$WHEELS_DIR"/nccl_extensions-${NCCL_EXT_VERSION}-*.whl >/dev/null 2>&1; then
+  log "nccl-extensions-${NCCL_EXT_VERSION} 已存在, 跳过"
+else
+  fetch "nccl-extensions" "nccl-extensions==${NCCL_EXT_VERSION}" \
+    || { log "  nccl-extensions 下载失败(构建时将在线兜底)"; status=1; }
 fi
 
 log "wheel 目录: $WHEELS_DIR"
