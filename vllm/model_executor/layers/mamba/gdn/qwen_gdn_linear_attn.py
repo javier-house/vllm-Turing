@@ -12,6 +12,7 @@ from torch import nn
 from vllm import _custom_ops as ops
 from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import (
     VllmConfig,
     get_current_vllm_config,
@@ -2065,6 +2066,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
 
 
+# piecewise cudagraph 兼容: GDN core 内含 host 侧状态操作 (按请求变的 SSM state、
+# flashqla metadata 构建), 不可被 capture 进 breakable graph —— 用
+# eager_break_during_capture 在 capture 期自动切成 eager 断点 (replay 时也走 eager),
+# 保证输入/输出 buffer 地址跨 replay 不变。此前缺此装饰器导致 FULL_AND_PIECEWISE
+# 的 prefill graph replay 阶段 IMA (warmup 即崩)。
+@eager_break_during_capture
 def qwen_gdn_attention_core(
     qkv_or_qkvz: torch.Tensor,
     b_or_ba: torch.Tensor,
@@ -2125,6 +2132,7 @@ direct_register_custom_op(
 )
 
 
+@eager_break_during_capture
 def qwen_gdn_attention_core_fused_norm_packed(
     mixed_qkvz: torch.Tensor,
     ba: torch.Tensor,

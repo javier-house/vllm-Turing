@@ -4,7 +4,7 @@
 set -a
 export FLASH_QLA_SM75_PREBUILT_EXTENSION_PATH=/opt/vllm-turing/extensions/flash_qla_sm75_gdn.so
 export FLASH_QLA_SM75_ALLOW_JIT=0
-export VLLM_FIREFLY_DIRECT=1
+export VLLM_FIREFLY_DIRECT=0
 export PYTHONUNBUFFERED=1
 export NCCL_P2P_LEVEL=SYS
 export VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC=1
@@ -27,7 +27,7 @@ exec vllm serve /model_w4a16 \
   --gdn-prefill-backend flashqla_sm75 \
   --moe-backend auto \
   --enable-prefix-caching \
-  --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
+  --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE"}' \
   --reasoning-parser qwen3 \
   --enable-prompt-tokens-details \
   --enable-auto-tool-choice \
