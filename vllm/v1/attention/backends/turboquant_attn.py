@@ -864,27 +864,22 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 seq_lens_cpu=attn_metadata.seq_lens_cpu[num_decodes:]
                 if attn_metadata.seq_lens_cpu is not None
                 else None,
-                # Firefly TQ prefill: 全批 build 阶段 plan 的 per-request FI
-                # wrapper 透传给 prefill 子批, key 从全批下标 remap 到子批下标
-                # (i - num_decodes)。整批 first-chunk 的单 wrapper 不在此列
-                # (它只用于纯 prefill 批, 混合批走 per-request dict)。
+                # Firefly TQ prefill: build 阶段 _plan_tq_fi_wrappers 存的
+                # per-request wrapper, key 已是 prefill 子批下标 (sub_idx =
+                # i - num_decodes, i 为全批下标), 与 _prefill_attention 消费端
+                # for i in range(num_prefill) 的 .get(i) 一致 → 直接透传, 勿再减
+                # num_decodes (旧版双重减 → 最后 num_decodes 个请求取 None,
+                # continuation 掉 SDPA O(N²) 长 ctx OOM)。整批 first-chunk 单
+                # wrapper 不在此列 (它只用于纯 prefill 批, 混合批走 per-request)。
                 flashinfer_first_chunk_wrappers=(
-                    {
-                        i - num_decodes: w
-                        for i, w in (
-                            attn_metadata.flashinfer_first_chunk_wrappers or {}
-                        ).items()
-                    }
-                    or None
+                    dict(attn_metadata.flashinfer_first_chunk_wrappers)
+                    if attn_metadata.flashinfer_first_chunk_wrappers
+                    else None
                 ),
                 flashinfer_continuation_wrappers=(
-                    {
-                        i - num_decodes: w
-                        for i, w in (
-                            attn_metadata.flashinfer_continuation_wrappers or {}
-                        ).items()
-                    }
-                    or None
+                    dict(attn_metadata.flashinfer_continuation_wrappers)
+                    if attn_metadata.flashinfer_continuation_wrappers
+                    else None
                 ),
             )
             k = key[:N].view(N, self.num_kv_heads, self.head_size)
