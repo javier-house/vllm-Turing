@@ -42,18 +42,20 @@ def _firefly_direct() -> bool:
 
 
 def _firefly_ar_mode() -> bool:
-    """VLLM_FIREFLY_AR 归一化: 纯开关, 默认开; '0'/'off'/'false'/'no' 关。
+    """VLLM_FIREFLY_AR 归一化: 纯开关, 默认关; '1'/'on'/'true'/'yes' 开。
 
     fp8 allreduce (FireflyAllReduce, 双 backend P2P/SHM, 见
-    VLLM_FIREFLY_AR_BACKEND) 是否启用, 与 firefly 权重路径无关(通信独立),
-    fp8 近乎无损(PLAN-fp8-allreduce §3.5)。旧取值 'auto'(跟随总开关)/'fp8'
-    一并归开, 兼容历史脚本。纯运行时选择 → pop 出 compile_factors。
+    VLLM_FIREFLY_AR_BACKEND) 是否启用, 与 firefly 权重路径 (VLLM_FIREFLY_DIRECT)
+    无关 (通信独立), fp8 近乎无损 (PLAN-fp8-allreduce §3.5)。09-29 重构
+    (3e029be) 曾把 'auto'(跟随总开关) 改成纯开关并默认开, 2026-10-02 应用户
+    要求改回默认关 (与重构前 auto→关 的事实行为一致), 显式 =1 才启用。纯
+    运行时选择 → pop 出 compile_factors。
     """
-    return os.getenv("VLLM_FIREFLY_AR", "1").strip().lower() not in (
-        "0",
-        "off",
-        "false",
-        "no",
+    return os.getenv("VLLM_FIREFLY_AR", "0").strip().lower() in (
+        "1",
+        "on",
+        "true",
+        "yes",
     )
 
 
@@ -325,8 +327,8 @@ EXTENSIONS: dict[str, object] = {
     "VLLM_FIREFLY_DEQUANT_MODEL": lambda: (
         os.environ.get("VLLM_FIREFLY_DEQUANT_MODEL", "def")
     ),
-    # fp8 allreduce (FireflyAllReduce) 开关, 默认开(_firefly_ar_mode 归一化,
-    # 纯开关); 0 单独关。与 firefly 权重路径无关(通信独立, 对任意 TP 都赚)。
+    # fp8 allreduce (FireflyAllReduce) 开关, 默认关(_firefly_ar_mode 归一化,
+    # 纯开关); 显式 1 才开。与 firefly 权重路径无关(通信独立, 对任意 TP 都赚)。
     # TP2 每层 2 次 AllReduce 量减半 (fp16->fp8), 省 ~480-530ms/27B prefill。
     # 见 distributed/device_communicators/firefly_allreduce.py / PLAN-fp8-allreduce。
     "VLLM_FIREFLY_AR": _firefly_ar_mode,

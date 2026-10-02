@@ -13,7 +13,7 @@ world_size 为 >=4 的 2 的幂 (TP4/8/...) 走 butterfly (SHM/P2P, 无 P2P 如 
 走 SHM, 单一 shm_base host-mapped 区 + D2H/H2D memcpy)。
 
 env:
-  VLLM_FIREFLY_AR (开关, 默认开; 0 单独关, 与 firefly 权重路径无关)
+  VLLM_FIREFLY_AR (开关, 默认关; 1 单独开, 与 firefly 权重路径无关)
   VLLM_FIREFLY_AR_MIN_SIZE (小消息回退 NCCL; decode 小消息的 amax+flag 固定
     开销可能超过砍半省下的传输, 见 MIN_SIZE 注释)
 """
@@ -50,10 +50,11 @@ _LIB.cudaHostUnregister.restype = ctypes.c_int
 
 
 def firefly_ar_active() -> bool:
-    """fp8 allreduce 是否启用: VLLM_FIREFLY_AR 纯开关 (默认开, 0=关)。
+    """fp8 allreduce 是否启用: VLLM_FIREFLY_AR 纯开关 (默认关, 1=开)。
 
     与 firefly 权重路径 (VLLM_FIREFLY_DIRECT) 无关 —— 通信独立, 对任意 TP 都
-    赚。旧取值 'auto'/'fp8' 已被 envs_sm75 归一化器并入开。
+    赚。旧取值 'auto'/'fp8' 已被 envs_sm75 归一化器处理 ('auto' 原跟随总开关,
+    总开关已删)。
 
     用户显式开 FlashInfer PCIe-IPC AR (VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC,
     v0.30 底座才有, 默认 0 opt-in) 时让路: 二者都是抢 TP 组的小消息 AR, 不该并

@@ -64,16 +64,26 @@ class DirectEnvTest(unittest.TestCase):
             )
         self._clear("VLLM_FIREFLY_DIRECT")
 
-    def test_ar_default_on(self):
+    def test_ar_default_off(self):
         self._clear("VLLM_FIREFLY_AR")
-        self.assertTrue(self.envs_sm75._firefly_ar_mode())
+        self.assertFalse(self.envs_sm75._firefly_ar_mode())
 
     def test_ar_on_table(self):
         import os
 
-        for v in ("1", "on", "true", "yes", "fp8", "auto", "AUTO"):
+        for v in ("1", "on", "true", "yes"):
             os.environ["VLLM_FIREFLY_AR"] = v
             self.assertTrue(self.envs_sm75._firefly_ar_mode(), f"AR={v!r} 应判开")
+        self._clear("VLLM_FIREFLY_AR")
+
+    def test_ar_legacy_values_off(self):
+        # 旧 'auto'(跟随总开关)/'fp8' 取值: 总开关已删、getter 改纯开关,
+        # 归一化器不再认, 缺省/旧值一律判关。
+        import os
+
+        for v in ("fp8", "auto", "AUTO"):
+            os.environ["VLLM_FIREFLY_AR"] = v
+            self.assertFalse(self.envs_sm75._firefly_ar_mode(), f"AR={v!r} 应判关")
         self._clear("VLLM_FIREFLY_AR")
 
     def test_ar_off_table(self):
