@@ -2,17 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import contextlib
-import os
 import queue
 import sys
-import time
 import uuid
 import weakref
 from abc import ABC, abstractmethod
 from collections import Counter, defaultdict
 from collections.abc import Awaitable, Callable, Sequence
 from concurrent.futures import Future
-from copy import copy
 from dataclasses import dataclass
 from multiprocessing.connection import Connection
 from multiprocessing.queues import Queue
@@ -470,12 +467,6 @@ class BackgroundResources:
     # processing threads can access it without holding a ref to the client.
     engine_dead: bool = False
 
-    # vllm-turing overlay: set when the engine exited intentionally for deep
-    # sleep (auto-sleep offload-target "exit").  Distinct from engine_dead:
-    # the client stays alive and transparently respawns the engine on the
-    # next request.
-    engine_sleeping: bool = False
-
     def __call__(self):
         """Clean up background resources."""
 
@@ -575,9 +566,6 @@ class MPClient(EngineCoreClient):
     ):
         self.vllm_config = vllm_config
         self._renderer: BaseRenderer | None = renderer
-        # The ready handshake replaces block_size with the scheduler's derived
-        # value. Rebuilding must use the original input, just like a cold start.
-        self._respawn_initial_block_size = vllm_config.cache_config.block_size
 
         # ZMQ setup.
         sync_ctx = zmq.Context(io_threads=2)
@@ -593,24 +581,10 @@ class MPClient(EngineCoreClient):
             # State used for data parallel.
             self.engines_running = False
             parallel_config = vllm_config.parallel_config
-            # vllm-turing overlay: deep-sleep exit (auto-sleep offload-target
-            # "exit") terminates and later respawns the engine in place, so
-            # the input ROUTER needs handover to let the respawned engine
-            # take over the same connection identity.
-            self._deep_sleep_exit_enabled = (
-                os.environ.get("VLLM_AUTO_SLEEP_OFFLOAD_TARGET") == "exit"
-            )
-            # vllm-turing overlay: launch parameters captured for deep-sleep
-            # respawn (populated only when _deep_sleep_exit_enabled).
-            self._respawn_executor_class: type[Executor] | None = None
-            self._respawn_log_stats: bool = False
-            self._respawn_addresses: Any = None
             # Elastic EP can remove a rank and later add it back with the same
             # identity. The client input ROUTER needs handover to allow the new
             # engine to replace the dead connection.
-            enable_input_socket_handover = (
-                parallel_config.enable_elastic_ep or self._deep_sleep_exit_enabled
-            )
+            enable_input_socket_handover = parallel_config.enable_elastic_ep
 
             self.stats_update_address: str | None = None
             tensor_queue: Queue | None = None
@@ -695,13 +669,6 @@ class MPClient(EngineCoreClient):
                     # engine-core model load (minutes) that follows is exactly
                     # what the warmup should overlap with.
                     self._start_mm_warmup()
-
-                # vllm-turing overlay: save the launch parameters so a deep-sleep
-                # exit can respawn the engine in place on the next request.
-                if self._deep_sleep_exit_enabled:
-                    self._respawn_executor_class = executor_class
-                    self._respawn_log_stats = log_stats
-                    self._respawn_addresses = addresses
 
                 self.stats_update_address = addresses.frontend_stats_publish_address
                 if coordinator is not None:
@@ -820,23 +787,6 @@ class MPClient(EngineCoreClient):
             _self = self_ref()
             if not _self or not _self._finalizer.alive or _self.resources.engine_dead:
                 return
-            # vllm-turing overlay: an intentional deep-sleep exit is signalled on
-            # the output socket right before the process exits.  The engine
-            # flushes that sentinel (joining its output thread) before exiting,
-            # but allow a brief grace in case it is still being processed so we
-            # do not mistake the exit for a crash.  Only applies when deep
-            # sleep is enabled; the crash path is unchanged otherwise.
-            if (
-                _self._deep_sleep_exit_enabled
-                and not _self.resources.engine_sleeping
-            ):
-                time.sleep(0.5)
-            if _self.resources.engine_sleeping:
-                logger.info(
-                    "[deep-sleep] MPClient: engine exited intentionally; client "
-                    "stays alive and respawns it on the next request."
-                )
-                return
             _self.resources.engine_dead = True
             logger.warning_once(
                 "[shutdown] MPClient: engine core exited unexpectedly; starting cleanup"
@@ -849,45 +799,6 @@ class MPClient(EngineCoreClient):
         Thread(
             target=monitor_engine_cores, daemon=True, name="MPClientEngineMonitor"
         ).start()
-
-    def _make_respawn_config(self) -> VllmConfig:
-        config = copy(self.vllm_config)
-        config.cache_config = copy(self.vllm_config.cache_config)
-        config.cache_config.block_size = self._respawn_initial_block_size
-        config.cache_config.num_gpu_blocks = 0
-        return config
-
-    def _respawn_launch(self) -> None:
-        # vllm-turing overlay: deep-sleep respawn (spawn + handshake only).
-        #
-        # Re-runs the launch machinery so the new EngineCore process
-        # re-handshakes and reconnects to this client's still-bound
-        # input/output sockets (the input ROUTER has handover enabled for deep
-        # sleep).  Blocking: it includes the engine's full model load, so
-        # callers must run it off the event loop (e.g. asyncio.to_thread).
-        # Only the DP=1, single-API-server topology is supported.
-        if self._respawn_addresses is None:
-            raise RuntimeError(
-                "deep-sleep respawn requires the client-managed (single API "
-                "server) engine topology; it is unavailable when engine "
-                "addresses are provided externally (multi-API-server)."
-            )
-        if self.vllm_config.parallel_config.data_parallel_size > 1:
-            raise RuntimeError(
-                "deep-sleep respawn currently supports only "
-                "data_parallel_size=1 (the DP coordinator is not respawned)."
-            )
-        # num_gpu_blocks is accumulated by _apply_ready_response, so reset it
-        # before the fresh engine reports its value again.
-        self.vllm_config.cache_config.num_gpu_blocks = 0
-        with launch_core_engines(
-            self._make_respawn_config(),
-            self._respawn_executor_class,
-            self._respawn_log_stats,
-            self._respawn_addresses,
-        ) as engine_launch:
-            self.resources.coordinator = engine_launch.coordinator
-            self.resources.engine_manager = engine_launch.engine_manager
 
     def _apply_ready_response(self, payload: bytes) -> None:
         """Decode an EngineCoreReadyResponse and sync any post-initialization
@@ -1201,16 +1112,6 @@ class AsyncMPClient(MPClient):
             try:
                 while True:
                     frames = await output_socket.recv_multipart(copy=False)
-                    # vllm-turing overlay: deep-sleep exit sentinel.  The engine
-                    # is terminating intentionally (auto-sleep "exit"); mark
-                    # it and keep waiting so the respawned engine's outputs
-                    # are picked up, rather than surfacing an EngineDeadError.
-                    if (
-                        len(frames) == 1
-                        and frames[0].buffer == EngineCoreProc.DEEP_SLEEP_EXITING
-                    ):
-                        resources.engine_sleeping = True
-                        continue
                     resources.validate_alive(frames)
                     outputs: EngineCoreOutputs = decoder.decode(frames)
                     if outputs.utility_output:
@@ -1319,38 +1220,6 @@ class AsyncMPClient(MPClient):
         request.client_index = self.client_index
         await self._send_input(EngineCoreRequestType.ADD, request)
         self._ensure_output_queue_task()
-
-    async def respawn_engine(self) -> None:
-        # vllm-turing overlay: respawn the EngineCore after a deep-sleep exit.
-        #
-        # The blocking launch (process spawn + handshake, incl. the full model
-        # load) runs in a worker thread; the READY wait uses the asyncio input
-        # socket here on the event loop so no ZMQ socket is touched from two
-        # threads at once.  Callers must serialize concurrent respawns.
-        await asyncio.to_thread(self._respawn_launch)
-
-        # Wait for ready messages from the respawned engine on the input
-        # socket (mirrors __init__; the engine re-sends its
-        # EngineCoreReadyResponse after reconnecting).
-        identities = set(self.core_engines)
-        deadline = time.monotonic() + VLLM_ENGINE_READY_TIMEOUT_S
-        while identities:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(
-                    "Timed out waiting for the respawned engine core to start "
-                    f"after deep sleep (waited {VLLM_ENGINE_READY_TIMEOUT_S}s)."
-                )
-            identity, payload = await asyncio.wait_for(
-                self.input_socket.recv_multipart(), timeout=remaining
-            )
-            identities.remove(identity)
-            self._apply_ready_response(payload)
-
-        self.resources.engine_sleeping = False
-        self.resources.engine_dead = False
-        # Re-arm liveness monitoring for the new engine process.
-        self.start_engine_core_monitor()
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:
         if request_ids and not self.resources.engine_dead:

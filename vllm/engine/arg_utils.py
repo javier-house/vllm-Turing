@@ -748,16 +748,6 @@ class EngineArgs:
     generation_config: str = ModelConfig.generation_config
     enable_sleep_mode: bool = ModelConfig.enable_sleep_mode
     enable_cumem_allocator: bool = ModelConfig.enable_cumem_allocator
-
-    # vllm-turing overlay: auto-sleep control plane. Not part of VllmConfig;
-    # EngineArgs.__post_init__ propagates the values to the VLLM_AUTO_SLEEP_*
-    # envs so the engine-core subprocess (vllm.v1.engine.auto_sleep) reads
-    # them. See tmp/PLAN-auto-sleep-mode.md.
-    auto_sleep_idle_timeout: float = 0.0
-    auto_sleep_offload_target: str = "cpu"
-    auto_sleep_reload_path: str | None = None
-    auto_sleep_disk_path: str | None = None
-    auto_sleep_page_cache_keep_interval: float = 600.0
     override_generation_config: dict[str, Any] = get_field(
         ModelConfig, "override_generation_config"
     )
@@ -891,50 +881,6 @@ class EngineArgs:
                         self.tokenizer,
                     )
 
-        # vllm-turing overlay: validate --auto-sleep-* and propagate to envs
-        # (after the offline model-path rewrite above, so the reload path
-        # points at the resolved local directory when HF_HUB_OFFLINE).
-        self._apply_auto_sleep_envs()
-
-    def _apply_auto_sleep_envs(self) -> None:
-        # vllm-turing overlay: the engine-core subprocess inherits these envs;
-        # they are consumed by vllm.v1.engine.auto_sleep there.
-        if self.auto_sleep_idle_timeout < 0:
-            raise ValueError(
-                "--auto-sleep-idle-timeout must be >= 0, "
-                f"got {self.auto_sleep_idle_timeout}"
-            )
-        if self.auto_sleep_offload_target not in ("cpu", "reload", "exit", "disk"):
-            raise ValueError(
-                "--auto-sleep-offload-target must be 'cpu', 'reload', or "
-                f"'exit', or 'disk', got {self.auto_sleep_offload_target!r}"
-            )
-        if self.auto_sleep_page_cache_keep_interval < 0:
-            raise ValueError(
-                "--auto-sleep-page-cache-keep-interval must be >= 0, "
-                f"got {self.auto_sleep_page_cache_keep_interval}"
-            )
-        if self.auto_sleep_idle_timeout <= 0:
-            return
-        # 'cpu'/'reload' sleep via the cumem allocator and need sleep mode;
-        # 'exit' terminates the process outright and does not.
-        if not self.enable_sleep_mode and self.auto_sleep_offload_target != "exit":
-            raise ValueError(
-                "--auto-sleep-idle-timeout requires --enable-sleep-mode"
-            )
-        os.environ["VLLM_AUTO_SLEEP_IDLE_TIMEOUT"] = str(self.auto_sleep_idle_timeout)
-        os.environ["VLLM_AUTO_SLEEP_OFFLOAD_TARGET"] = self.auto_sleep_offload_target
-        if self.auto_sleep_offload_target == "disk":
-            if not self.auto_sleep_disk_path or not os.path.isabs(self.auto_sleep_disk_path):
-                raise ValueError("Disk sleep requires --auto-sleep-disk-path (absolute)")
-            os.environ["VLLM_AUTO_SLEEP_DISK_PATH"] = self.auto_sleep_disk_path
-        os.environ["VLLM_AUTO_SLEEP_RELOAD_PATH"] = (
-            self.auto_sleep_reload_path or str(self.model)
-        )
-        os.environ["VLLM_AUTO_SLEEP_PAGE_CACHE_KEEP_INTERVAL"] = str(
-            self.auto_sleep_page_cache_keep_interval
-        )
-
     @staticmethod
     def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         """Shared CLI arguments for vLLM engine."""
@@ -1025,47 +971,6 @@ class EngineArgs:
         )
         model_group.add_argument(
             "--enable-cumem-allocator", **model_kwargs["enable_cumem_allocator"]
-        )
-        # vllm-turing overlay: auto-sleep control plane (see EngineArgs fields).
-        model_group.add_argument(
-            "--auto-sleep-idle-timeout",
-            type=float,
-            default=0.0,
-            help="Minutes of idleness before the engine auto-sleeps; 0 "
-            "disables. Requires --enable-sleep-mode.",
-        )
-        model_group.add_argument(
-            "--auto-sleep-offload-target",
-            choices=["cpu", "reload", "exit", "disk"],
-            default="cpu",
-            help="'disk': save runtime model allocations to disk and restore "
-            "them in place (requires --auto-sleep-disk-path); "
-            "'cpu': keep weights in pinned CPU memory (sleep level 1, "
-            "fast wake); 'reload': discard weights and reload them from the "
-            "checkpoint on wake (sleep level 2, slow wake, no CPU backup); "
-            "'exit': terminate the engine-core process entirely (deep sleep, "
-            "frees GPU memory + CUDA context + workers), respawned "
-            "transparently on the next request (cold start).",
-        )
-        model_group.add_argument(
-            "--auto-sleep-reload-path",
-            default=None,
-            help="Checkpoint path used to reload weights on wake when the "
-            "offload target is 'reload'. Defaults to the model path.",
-        )
-        model_group.add_argument(
-            "--auto-sleep-page-cache-keep-interval",
-            type=float,
-            default=600.0,
-            help="Seconds between page-cache re-warm ticks while the engine "
-            "sleeps in 'reload' mode; keeps the checkpoint in the OS page "
-            "cache so the wake-time reload read is fast. 0 disables the "
-            "background keeper (a one-shot warm on sleep/wake still happens).",
-        )
-        model_group.add_argument(
-            "--auto-sleep-disk-path", type=str, default=None,
-            help="Absolute disk directory for per-worker runtime snapshots. "
-            "Use a persistent bind mount, not tmpfs or /dev/shm.",
         )
         model_group.add_argument("--model-impl", **model_kwargs["model_impl"])
         model_group.add_argument(
@@ -1956,8 +1861,6 @@ class EngineArgs:
             generation_config=self.generation_config,
             override_generation_config=self.override_generation_config,
             enable_sleep_mode=self.enable_sleep_mode,
-            sleep_mode_backend=("disk" if self.auto_sleep_offload_target == "disk"
-                                else ModelConfig.sleep_mode_backend),
             enable_cumem_allocator=self.enable_cumem_allocator,
             model_impl=self.model_impl,
             logits_processors=self.logits_processors,

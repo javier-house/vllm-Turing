@@ -72,8 +72,6 @@ from vllm.v1.engine import (
     UtilityOutput,
     UtilityResult,
 )
-# vllm-turing overlay: idle auto-sleep controller (no-op unless configured)
-from vllm.v1.engine.auto_sleep import AutoSleepController
 from vllm.v1.engine.tensor_ipc import TensorIpcReceiver
 from vllm.v1.engine.utils import (
     EngineHandshakeMetadata,
@@ -242,12 +240,6 @@ class EngineCore:
         self.aborts_queue = queue.Queue[list[str]]()
 
         self._idle_state_callbacks: list[Callable] = []
-
-        # vllm-turing overlay: idle auto-sleep (no-op unless the
-        # --auto-sleep-* / VLLM_AUTO_SLEEP_* configuration is present).
-        self.auto_sleep = AutoSleepController(self, EngineCoreRequestType.WAKEUP)
-        if self.auto_sleep.enabled:
-            self._idle_state_callbacks.append(self.auto_sleep.on_idle)
 
         # Mark the startup heap as static so that it's ignored by GC.
         # Reduces pause times of oldest generation collections.
@@ -471,9 +463,6 @@ class EngineCore:
             raise TypeError(
                 f"request_id must be a string, got {type(request.request_id)}"
             )
-
-        # vllm-turing overlay: refresh auto-sleep idle clock / wake engine.
-        self.auto_sleep.on_request_arrival()
 
         if pooling_params := request.pooling_params:
             supported_pooling_tasks = [
@@ -1066,11 +1055,6 @@ class EngineCoreProc(EngineCore):
     """ZMQ-wrapper for running EngineCore in background process."""
 
     ENGINE_CORE_DEAD = b"ENGINE_CORE_DEAD"
-    # vllm-turing overlay: deep-sleep exit sentinel. Sent on the output socket
-    # immediately before an intentional auto-sleep process exit, so the client
-    # can tell it apart from a crash and respawn the engine on the next
-    # request instead of treating it as fatal.
-    DEEP_SLEEP_EXITING = b"DEEP_SLEEP_EXITING"
     addresses: EngineZmqAddresses
 
     @instrument(span_name="EngineCoreProc init")
@@ -1528,13 +1512,8 @@ class EngineCoreProc(EngineCore):
         return model_executed
 
     def _notify_idle_state_callbacks(self) -> None:
-        # Snapshot before invoking: a callback may re-register itself
-        # during the call (the auto-sleep controller does, to stay
-        # subscribed across idle periods).  Popping the live list would
-        # spin forever on such a callback; the snapshot defers any
-        # re-registration to the next idle notification.
-        callbacks, self._idle_state_callbacks = self._idle_state_callbacks, []
-        for callback in callbacks:
+        while self._idle_state_callbacks:
+            callback = self._idle_state_callbacks.pop()
             callback(self)
 
     def _handle_shutdown(self) -> bool:
@@ -1591,8 +1570,6 @@ class EngineCoreProc(EngineCore):
         """Dispatch request from client."""
 
         if request_type == EngineCoreRequestType.WAKEUP:
-            # vllm-turing overlay: auto-sleep timer poke (no-op unless armed).
-            self.auto_sleep.on_wakeup_poke()
             return
         elif request_type == EngineCoreRequestType.ADD:
             req, request_wave = request
@@ -1697,75 +1674,6 @@ class EngineCoreProc(EngineCore):
             logger.fatal(
                 "vLLM shutdown signal from EngineCore failed "
                 "to send. Please report this issue."
-            )
-
-    # vllm-turing overlay: deep-sleep exit (auto-sleep offload-target "exit").
-    def _send_deep_sleep_exiting(self):
-        """Notify the client that this process is exiting intentionally for
-        deep sleep, so it respawns the engine on the next request instead of
-        treating the exit as a crash."""
-        self.output_queue.put_nowait(EngineCoreProc.DEEP_SLEEP_EXITING)
-        # Ensure the sentinel is flushed before shutdown, mirroring
-        # _send_engine_dead.
-        self.output_thread.join(timeout=5.0)
-        if self.output_thread.is_alive():
-            logger.warning(
-                "[deep-sleep] EngineCore: DEEP_SLEEP_EXITING was not flushed "
-                "in time; the client may treat this exit as a crash."
-            )
-
-    def request_deep_sleep_exit(self) -> None:
-        """Intentionally terminate this EngineCore process to free all GPU
-        memory (weights, CUDA context, worker processes).
-
-        Called by the auto-sleep controller on the main loop thread once the
-        engine has been idle past its timeout.  Notifies the client first,
-        then requests a normal shutdown so run_busy_loop unwinds and the
-        finally block tears down the executor.  The process exits with code 0.
-        """
-        logger.info(
-            "[deep-sleep] EngineCore: idle timeout reached; exiting process. "
-            "The client will respawn the engine on the next request."
-        )
-        self._destroy_nccl_symmetric_for_exit()
-        self._send_deep_sleep_exiting()
-        self.shutdown_state = EngineShutdownState.REQUESTED
-
-    def _destroy_nccl_symmetric_for_exit(self) -> None:
-        """Deep-sleep exit: 主线程统一经 collective_rpc(barrier 语义)驱动全部
-        worker 对称销毁 NCCL process group。
-
-        PP(跨 stage P2P)下 NCCL 对称握手时序敏感; 若只靠 shutdown 的被动
-        SIGTERM + 短 grace, PP worker 可能在握手走不完时被 SIGKILL 砍断, 卡在
-        P2P 死锁(CPU 100%)占死显存, 使后续 respawn 反复失败。这里在 exit 时
-        主动、全员同步地 destroy, 对称握手天然全员在场。之后 shutdown 的
-        worker finally 再 destroy 一次是 no-op(destroy 幂等)。
-        仅解 NCCL process group, 不碰 MQ/不退出进程(那是 shutdown 的活)。
-        """
-        def _destroy_nccl(_worker):
-            # 闭包经 cloudpickle 序列化到各 worker 进程执行, import 必须内联。
-            from vllm.distributed.parallel_state import (
-                destroy_distributed_environment,
-                destroy_model_parallel,
-            )
-
-            destroy_model_parallel()
-            destroy_distributed_environment()
-            return True
-
-        try:
-            self.model_executor.collective_rpc(
-                _destroy_nccl, timeout=60.0
-            )
-            logger.info(
-                "[deep-sleep] EngineCore: NCCL process groups destroyed "
-                "symmetrically before exit"
-            )
-        except Exception:
-            logger.warning(
-                "[deep-sleep] EngineCore: symmetric NCCL destroy failed; "
-                "falling back to shutdown grace period",
-                exc_info=True,
             )
 
     def _make_ready_response(self) -> EngineCoreReadyResponse:
@@ -1950,12 +1858,7 @@ class EngineCoreProc(EngineCore):
 
             while True:
                 output = self.output_queue.get()
-                # vllm-turing overlay: DEEP_SLEEP_EXITING rides the same
-                # send-and-stop channel as ENGINE_CORE_DEAD.
-                if output in (
-                    EngineCoreProc.ENGINE_CORE_DEAD,
-                    EngineCoreProc.DEEP_SLEEP_EXITING,
-                ):
+                if output == EngineCoreProc.ENGINE_CORE_DEAD:
                     for socket in sockets:
                         socket.send(output)
                     break

@@ -755,8 +755,6 @@ def main() -> None:
     source_root = args.overlay.resolve()
     package_root = Path(vllm.__file__).resolve().parent
     files = [
-        "device_allocator/disk_snapshot.py",
-        "device_allocator/disk_sleep.py",
         "engine/arg_utils.py",
         "entrypoints/serve/instrumentator/monitor.py",
         "entrypoints/serve/instrumentator/dashboard.html",
@@ -775,9 +773,12 @@ def main() -> None:
         "distributed/device_communicators/cuda_communicator.py",
         "v1/attention/backends/flashinfer.py",
         "v1/attention/backends/gdn_attn.py",
+        # tq KV prefill 走 FlashInfer ragged wrapper (O(N), sm75 替代 FA2 崩 /
+        # SDPA OOM): 10 处改动含大段新代码, 走整文件覆盖而非锚点注入。
+        # VLLM_FIREFLY_TQ 默认开, 0 回退上游 FA2/SDPA。见 PLAN-firefly-tq-prefill。
+        "v1/attention/backends/turboquant_attn.py",
         "v1/core/sched/scheduler_sm75.py",
         "v1/engine/async_llm.py",
-        "v1/engine/auto_sleep.py",
         "v1/engine/core.py",
         "v1/engine/core_client.py",
         "models/qwen4_exp/nvidia/qsa.py",
@@ -802,12 +803,6 @@ def main() -> None:
 
     # 锚点注入: 对上游有同名、只改 1~2 行的文件不整文件覆盖(见 INJECTIONS)。
     apply_injections(package_root)
-
-    backend_file = package_root / "device_allocator/sleep_mode_backend.py"
-    registration = '\nSleepModeBackendFactory.register_backend(\n    "disk", "vllm.device_allocator.disk_sleep", "DiskSleepBackend",\n)\n'
-    backend_text = backend_file.read_text()
-    if '"vllm.device_allocator.disk_sleep"' not in backend_text:
-        backend_file.write_text(backend_text + registration)
 
     # SM75 扩展 env: 不整文件覆盖上游 vllm/envs.py, 改为 import 注入。
     # 往底座 envs.py 尾部追加一行, 触发 envs_sm75.apply()(把 EXTENSIONS 灌进

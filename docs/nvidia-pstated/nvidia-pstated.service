@@ -1,0 +1,18 @@
+[Unit]
+Description=NVIDIA P-State daemon (idle cards -> P8, NVAPI forced)
+After=multi-user.target
+Wants=multi-user.target
+
+[Service]
+Type=simple
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# === 配置区 (改后: systemctl daemon-reload && systemctl restart nvidia-pstated) ===
+# 作用卡: ExecStart 串里 GPUS="" 为空=所有卡(默认); 改 GPUS="4,5,6,7"=只指定卡
+# nvidia-pstated 参数: -ut 5 空闲阈值% | -ibs 30 防抖3s | -psl 8 空闲P8 | -psh 16 负载P16(auto) | -tt 80 温度强制降频
+# 末尾 exec 替换 bash 进程 -> systemd MainPID = nvidia-pstated (stop/kill 能直达)
+ExecStart=/bin/bash -c 'GPUS=""; IDS=(); [ -n "$GPUS" ] && IDS=(-i "$GPUS"); exec /usr/local/sbin/t10-gpu-thermal/nvidia-pstated "${IDS[@]}" -ut 5 -ibs 30 -psl 8 -psh 16 -tt 80'
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -32,4 +32,5 @@ exec vllm serve /model_w4a16 \
   --enable-prompt-tokens-details \
   --enable-auto-tool-choice \
   --tool-call-parser qwen3_coder \
-  --trust-remote-code
+  --trust-remote-code \
+  --enable-sleep-mode

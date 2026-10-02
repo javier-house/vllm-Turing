@@ -18,7 +18,7 @@
 - DFlash2 的 SM75 数值兼容、AWQ 数据类型和 TP4 处理。
 - ModelScope、模型缓存与 vLLM/FlashInfer 编译缓存持久化。
 - 统一镜像支持普通推理、MTP5 和 DFlash2，通过启动参数选择模式。
-- 空闲自动睡眠支持 CPU、reload 和 exit；exit 模式释放引擎进程、CUDA context、worker 和显存，下一请求透明冷启动。
+- 宿主机 nvidia-pstated 空闲限频（P-State）：空闲卡降 P8 省功耗、来请求秒回满速，不释放显存。
 
 ## 快速复现
 
@@ -88,8 +88,7 @@ docker run -d --name vllm-turing-fp8 --gpus all --shm-size 16g \
   --hf-overrides '{"dtype":"float16"}' --generation-config vllm \
   --enable-prefix-caching --async-scheduling \
   --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE"}' \
-  --kv-transfer-config '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":8589934592}}' \
-  --auto-sleep-idle-timeout 30 --auto-sleep-offload-target exit
+  --kv-transfer-config '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":8589934592}}'
 ```
 
 **示例 B：不挂载本地项目**——与示例 A 唯一区别是去掉 `-v /path/to/vllm-Turing:/vllm-Turing`；entrypoint 改用镜像内自带的 `/vllm-Turing` 并自行 `clone`/`pull` 最新：
@@ -116,7 +115,6 @@ docker run -d --name vllm-turing-fp8 --gpus all --shm-size 16g \
   --enable-prefix-caching --async-scheduling \
   --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE"}' \
   --kv-transfer-config '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":8589934592}}' \
-  --auto-sleep-idle-timeout 30 --auto-sleep-offload-target exit
 ```
 
 **示例 C：启动但不更新代码（默认行为，生产环境建议）**——与示例 A 相同（仍挂载本地项目），不设 `VLLM_TURING_UPDATE` 即默认不拉取、用镜像内置代码。生产环境建议使用此方式：代码版本固定、启动时不联网更新，行为可预期。
@@ -144,7 +142,6 @@ docker run -d --name vllm-turing-fp8 --gpus all --shm-size 16g \
   --enable-prefix-caching --async-scheduling \
   --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE"}' \
   --kv-transfer-config '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":8589934592}}' \
-  --auto-sleep-idle-timeout 30 --auto-sleep-offload-target exit
 ```
 
 `--long-prefill-token-threshold N`：限制单个请求一个 step 内最多消化的 prefill token 数（chunked prefill 下生效），用来压住"超长 prompt 一步吃满整个 batch、把同批 decode 请求的输出间隔拖长"。取值须明显小于 `--max-num-batched-tokens` 才有效。副作用是长 prompt 的首字延迟（TTFT）变高、prefill 总时间变长；对本项目的 27B 模型无 firefly 顾虑——firefly int8 prefill 在 27B 上的交叉点 M\*<561，切到 2048~4096 的 chunk 仍远在收益区内。
@@ -200,51 +197,37 @@ INT4 路径用于大批量 prefill；本版本 FP8 线性计算仍使用 Marlin�
 
 ## 空闲自动休眠
 
-请求完成并进入空闲后开始计时，达到设定时间自动休眠；新推理请求到达时自动恢复，API 服务保持在线。主要用途是降低长时间闲置时的显存占用和 GPU 功耗。
+请求完成进入空闲后，宿主机上的 `nvidia-pstated`（NVIDIA 专有驱动的 NVAPI P-State 守护）把空闲 GPU 降到 **P8**（核心进低功耗态，约 15–20W/卡）；推理请求到达时自动切回 **boost**（P0/1590MHz）。只限频、不释放显存，适合模型常驻的推理服务——空闲省功耗、来请求秒回满速，API 服务保持在线。
 
-**日常省电、内存有限或使用 DFlash2，推荐 `exit`。** 示例默认空闲 30 分钟后退出引擎及 GPU worker，下一请求自动重建；不加 `--auto-sleep-idle-timeout` 参数则默认关闭自动休眠。
+相比容器内自动休眠（释放显存、下一请求冷启动重建），nvidia-pstated 保显存，常驻场景下无冷启动开销，作为本项目推荐的空闲省电方案。
 
-### 模式怎么选
+### 部署
 
-| 模式 | 休眠和唤醒方式 | 必要条件 | 效果与限制 |
-| --- | --- | --- | --- |
-| **`exit`（推荐）** | 退出引擎和 worker；从已有磁盘模型文件重建，并复用匹配编译缓存 | 主模型、草稿模型及配置文件持续可读；保留缓存挂载；不需要 `--enable-sleep-mode` | 释放本引擎的 CUDA 上下文，本地已测四卡 P8；首个请求需等待完整重建 |
-| `cpu` | 权重备份到 pinned CPU 内存，唤醒复制回 GPU | `--enable-sleep-mode`；额外 RAM 足够容纳实际权重备份（含草稿），另留服务内存 | 减少从磁盘重载权重的工作；保留进程和 CUDA 上下文，不保证 P8 |
-| `reload` | 丢弃 GPU 权重，唤醒从 checkpoint 重载主模型 | `--enable-sleep-mode`；可读且支持重载的 checkpoint；**当前不要用于 DFlash2**，草稿不随主模型一起重载 | 不保留整模型权重备份，但进程、缓冲区等仍占内存；不保证 P8 |
-
-exit/reload **不把运行时内存快照写入磁盘**，恢复来源是已有模型文件。编译缓存保存编译产物，不保存对话 KV；重启或 exit 唤醒后，长对话可能仍需重新处理输入。
-
-内存与磁盘预算：cpu 需额外预留权重备份空间，不能简单按压缩模型文件大小计算；本地约 31 GiB 内存主机不采用整模型 cpu 备份。脚本原有 **8 GiB CPU KV offload** 是另一项内存开销，选择 exit/reload 不会取消它。磁盘保留完整主模型、草稿和编译缓存即可，无需单独准备休眠快照文件；文件页缓存也会使用可回收主机内存。
-
-### 怎么配置
-
-保留原推理参数，在 `vllm serve` 命令末尾添加：
+宿主机需 NVIDIA 专有驱动（自带 `libnvidia-api.so.1`）与 root 权限。`nvidia-pstated` 二进制从 [sasha0552/nvidia-pstated](https://github.com/sasha0552/nvidia-pstated) 下载 v1.0.9；`nvidia-pstated.service` 见本仓库 [`docs/nvidia-pstated/`](docs/nvidia-pstated/nvidia-pstated.service)。
 
 ```bash
---auto-sleep-idle-timeout 30 --auto-sleep-offload-target exit
+sudo install -m 755 nvidia-pstated /usr/local/sbin/t10-gpu-thermal/nvidia-pstated
+sudo install -m 644 docs/nvidia-pstated/nvidia-pstated.service /etc/systemd/system/nvidia-pstated.service
+sudo systemctl daemon-reload && sudo systemctl enable --now nvidia-pstated
 ```
 
-超时单位是**分钟**：`1` = 60 秒测试，`30` = 日常 30 分钟，`0` = 关闭。在示例 `docker run` 的参数末尾改这两个值即可（`0` 时整组去掉）：
+### 配置
 
-```bash
-# 60 秒测试
---auto-sleep-idle-timeout 1 --auto-sleep-offload-target exit
-# 日常 30 分钟
---auto-sleep-idle-timeout 30 --auto-sleep-offload-target exit
-# 关闭自动休眠：去掉上面两个参数
-```
+全部内联在 `nvidia-pstated.service` 的 `ExecStart` 里（无独立配置文件）：
 
-模型、MTP/DFlash2、Firefly 等设置继续保留。已存在的同名容器需要按新参数重建（`docker rm -f <容器名>` 后重跑），不会自动替换；重建时保留模型与编译缓存挂载。
+| 项 | 位置 | 默认 / 说明 |
+| --- | --- | --- |
+| 作用卡 | `ExecStart` 串里 `GPUS=""` | 空=所有卡；改 `"4,5,6,7"`=只指定卡 |
+| 空闲阈值 | `-ut 5` | 利用率 ≤5% 视为空闲 |
+| 防抖 | `-ibs 30` | 空闲持续 30×100ms=3s 才降 P8（避免偶发低负载误判） |
+| 空闲 / 负载目标 | `-psl 8 -psh 16` | P8（空闲）/ P16=auto（boost） |
+| 温度强制降频 | `-tt 80` | >80°C 强制降频 |
 
-| 参数 | 作用 / 默认值 |
-| --- | --- |
-| `--auto-sleep-idle-timeout` | 空闲分钟数；CLI 默认 `0`（关闭），示例用 `30` |
-| `--auto-sleep-offload-target` | `exit` / `cpu` / `reload`；CLI 默认 `cpu`，示例用 `exit` |
-| `--enable-sleep-mode` | cpu/reload 必需，exit 不需要；选 cpu/reload 时手动加上 |
-| `--auto-sleep-reload-path` | reload 的容器内 checkpoint 路径，默认启动模型路径 |
-| `--auto-sleep-page-cache-keep-interval` | reload 文件页预热间隔，默认 `600` 秒；`0` 关闭后台预热，唤醒前仍提示预热一次 |
+改任意项后 `sudo systemctl daemon-reload && sudo systemctl restart nvidia-pstated`。
 
-exit 只在退出前提示预热主模型文件页，没有后台预热进程。预热是 OS 提示，不能保证唤醒必定命中内存中的文件页。客户端及反向代理超时应覆盖完整唤醒时间。
+### 实测（真机 8×Tesla T10）
+
+空闲 8 卡全 **P8 / 645MHz / 15–20W**；请求到达**第 1 秒**即冲 1590MHz（NVAPI 轮询 100ms，无 TTFT 损失）；请求结束约 5s 回 P8。有 CUDA context（模型常驻）的卡同样能稳定切 P8。
 
 ## License
 

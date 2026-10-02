@@ -29,8 +29,10 @@ exec vllm serve /model \
   --gdn-prefill-backend flashqla_sm75 \
   --enable-prefix-caching \
   --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE"}' \
+  --kv-transfer-config '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":8589934592}}' \
   --reasoning-parser qwen3 \
   --enable-prompt-tokens-details \
   --enable-auto-tool-choice \
   --tool-call-parser qwen3_coder \
-  --trust-remote-code
+  --trust-remote-code \
+  --enable-sleep-mode

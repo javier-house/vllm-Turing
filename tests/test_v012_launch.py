@@ -15,7 +15,6 @@ REQUIRED = (
     '--kv-cache-dtype fp8_e4m3',
     '-e VLLM_FIREFLY_DIRECT=1',
     '-e VLLM_FIREFLY_AR=1',
-    '--auto-sleep-idle-timeout 30 --auto-sleep-offload-target exit',
     '--kv-transfer-config ',
     'root/.cache/modelscope',
     'root/.cache/huggingface',

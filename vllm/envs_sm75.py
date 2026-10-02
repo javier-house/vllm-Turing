@@ -10,24 +10,14 @@ append 到上游 envs.py 尾部触发注入。注入做两件事:
 1) 把 EXTENSIONS getter 灌进 vllm.envs.environment_variables —— 上游
    __getattr__ / __dir__ / is_set / validate_environ / enable_envs_cache
    全围绕该 dict, 灌入后 envs.VLLM_FIREFLY_DIRECT 等属性访问自动生效(无需改调用方)。
-2) 包一层 vllm.envs.compile_factors, 把 INSTALL_IGNORED(idle auto-sleep 计时器)
-   从 hash factors pop 掉 —— 它们只影响调度/checkpoint, 不改变编译图。
+2) 包一层 vllm.envs.compile_factors, 把若干纯运行时 env(不影响编译图)
+   从 hash factors pop 掉 —— 它们只影响运行行为, 不改变编译图。
 
 好处: 上游 envs.py 后续升级随便改(内容级), 本文件只跟「dict + __getattr__
 + compile_factors 返回 dict」这个稳定机制耦合, 冲突面从整文件缩到一处注入。
 """
 
 import os
-
-# 需从 compile_factors hash 中排除的 key: idle auto-sleep 计时器/路径只影响
-# 调度与 checkpoint bookkeeping, 不改变编译图。切 test/prod sleep 计时不应
-# 使 torch.compile 缓存失配。
-INSTALL_IGNORED = {
-    "VLLM_AUTO_SLEEP_IDLE_TIMEOUT",
-    "VLLM_AUTO_SLEEP_OFFLOAD_TARGET",
-    "VLLM_AUTO_SLEEP_RELOAD_PATH",
-    "VLLM_AUTO_SLEEP_PAGE_CACHE_KEEP_INTERVAL",
-}
 
 
 def _firefly_direct() -> bool:
@@ -100,6 +90,29 @@ def _firefly_ar_pipe() -> bool:
     )
 
 
+def _firefly_tq() -> bool:
+    """VLLM_FIREFLY_TQ 归一化: 纯开关, 默认开; '0'/'off'/'false'/'no' 关(回退上游
+    原样 FA2/SDPA)。
+
+    开 = TurboQuant KV (tq4/tq8) 的 prefill 走 FlashInfer ragged wrapper
+    (O(N) 显存), 替代 FA2 C++ kernel (sm75 必崩: _HAS_FLASH_ATTN 只查 import
+    不查 cc) 与 SDPA 回退 (O(N²), 16G 卡长 context OOM)。plan 全在
+    TurboQuantMetadataBuilder.build 阶段 (host 侧, cudagraph 外), 数值与
+    SDPA/FA2 一致 (flashinfer fa2 kernel)。sm75/T10 上 flashinfer 0.7.0 的
+    ragged prefill 已验证 JIT 可用且与 SDPA 对 cos>0.999。
+    纯运行时路径选择, 不改编译图 → pop 出 compile_factors 复用历史编译产物;
+    0 作 kill-switch 回退 FA2/SDPA, 供其他卡/底座选择。
+    见 v1/attention/backends/turboquant_attn.py (install_sm75_overlay 注入) /
+    PLAN-firefly-tq-prefill。
+    """
+    return os.getenv("VLLM_FIREFLY_TQ", "1").strip().lower() not in (
+        "0",
+        "off",
+        "false",
+        "no",
+    )
+
+
 def _firefly_defer_recv() -> bool:
     """VLLM_FIREFLY_DEFER 归一化: 纯开关, 默认开; '0'/'off'/'false'/'no' 关。
 
@@ -157,7 +170,7 @@ def _ple_mmap() -> bool:
     开 = qwen4_exp 的 PLE(ngram) 大表 (如 Qwen3.8-Flash-Next 的 105GB 表) 不进
     显存, 走 NVMe mmap 行 gather 经内核 page cache 换页 (见 vllm/vllm_ple_mmap.py)。
     gather 是 CPU 活 + pageable H2D, 改走图外 custom op —— 会改变编译图行为,
-    故**不**加进 INSTALL_IGNORED、也不在 _compile_factors_sm75 pop: 开了就应是
+    故正常参与 compile_factors hash、也不在 _compile_factors_sm75 pop: 开了就应是
     新编译产物。
     """
     return os.getenv("VLLM_PLE_MMAP", "").strip().lower() in (
@@ -332,6 +345,10 @@ EXTENSIONS: dict[str, object] = {
     # 开 = 2-GPU SHM 大消息按 4MB 分块跨 2 stream overlap (全双工链通信项 ~2x,
     # 数值与串行一致); 半双工链 (T10/一号机) ≈ 无回退。仅 2-GPU SHM 生效。
     "VLLM_FIREFLY_AR_PIPE": _firefly_ar_pipe,
+    # tq KV prefill 走 FlashInfer ragged wrapper 开关, 默认开(_firefly_tq 归一化)。
+    # 开 = prefill O(N) 显存, 替代 FA2 (sm75 崩) / SDPA (长 ctx OOM); 0 = 回退
+    # 上游原样 (FA2/SDPA), 供其他卡/底座选择。
+    "VLLM_FIREFLY_TQ": _firefly_tq,
     # 单文件 HTML 监控页开关, 默认开(_monitor 归一化)。
     # 开 = serve 在 /monitor 挂自包含 HTML 看板(纯前端 canvas 图表, 无 CDN,
     # 轮询同源 /metrics); 0/off/false/no = 关(不挂路由)。见
@@ -345,7 +362,7 @@ EXTENSIONS: dict[str, object] = {
     # PLE(ngram) 大表 NVMe mmap 总开关, 默认关(_ple_mmap 归一化)。
     # 开 = qwen4_exp PLE 表 (如 105GB 的 Qwen3.8-Flash-Next) 不进显存, 走内核
     # page cache 换页行 gather。改变编译图 (gather 走图外 op) → 正常参与编译
-    # hash, 不加 INSTALL_IGNORED、不 pop。见 vllm/vllm_ple_mmap.py。
+    # hash, 不在 _compile_factors_sm75 pop。见 vllm/vllm_ple_mmap.py。
     "VLLM_PLE_MMAP": _ple_mmap,
     # PLE(ngram) 表 offload 模式: disk/mem/vram 三选一 (_ple_mmap_mode 归一化)。
     # disk=磁盘 mmap 换页(默认), mem=整表进 RAM, vram=不进显存 (不 offload, 不打
@@ -396,28 +413,6 @@ EXTENSIONS: dict[str, object] = {
     "VLLM_CUSTOM_ALLREDUCE_GRAPH_INPUT_MODE": lambda: os.getenv(
         "VLLM_CUSTOM_ALLREDUCE_GRAPH_INPUT_MODE", "auto"
     ),
-    # vllm-turing overlay: idle auto-sleep. Populated by EngineArgs from the
-    # --auto-sleep-* CLI flags; consumed inside the engine-core process by
-    # vllm.v1.engine.auto_sleep(那里用 os.environ.get 直读, 此处注册仅为让
-    # validate_environ 不告警 + 被 compile_factors 看到后由 INSTALL_IGNORED 排除)。
-    # Idle minutes (float) before the engine auto-sleeps; 0 disables.
-    "VLLM_AUTO_SLEEP_IDLE_TIMEOUT": lambda: float(
-        os.getenv("VLLM_AUTO_SLEEP_IDLE_TIMEOUT", "0")
-    ),
-    # 'cpu' (sleep level 1, pinned CPU backup) or 'reload' (sleep level 2,
-    # weights discarded and reloaded from the checkpoint on wake).
-    "VLLM_AUTO_SLEEP_OFFLOAD_TARGET": lambda: os.getenv(
-        "VLLM_AUTO_SLEEP_OFFLOAD_TARGET", "cpu"
-    ),
-    # Checkpoint path used to reload weights on wake for the 'reload' target.
-    "VLLM_AUTO_SLEEP_RELOAD_PATH": lambda: os.getenv("VLLM_AUTO_SLEEP_RELOAD_PATH", ""),
-    # Seconds between page-cache re-warm ticks while sleeping (reload mode);
-    # keeps the checkpoint in the OS page cache so the wake-time reload read
-    # is fast. 0 disables the background keeper (one-shot warm on sleep/wake
-    # still happens).
-    "VLLM_AUTO_SLEEP_PAGE_CACHE_KEEP_INTERVAL": lambda: float(
-        os.getenv("VLLM_AUTO_SLEEP_PAGE_CACHE_KEEP_INTERVAL", "600")
-    ),
 }
 
 
@@ -437,14 +432,12 @@ def apply() -> None:
     # 1) 注入 getter —— dict.update 天然幂等(同 key 覆盖同值)。
     envs.environment_variables.update(EXTENSIONS)
 
-    # 2) 包 compile_factors, 从 hash factors pop 掉 INSTALL_IGNORED(幂等: 已包跳过)。
+    # 2) 包 compile_factors, 从 hash factors pop 掉若干纯运行时 env(幂等: 已包跳过)。
     if not getattr(envs.compile_factors, "_sm75_wrapped", False):
         _orig = envs.compile_factors
 
         def _compile_factors_sm75():
             factors = _orig()
-            for key in INSTALL_IGNORED:
-                factors.pop(key, None)
             # 监控看板/测速页都只挂 HTTP 路由, 不影响编译图; 沿用"关"的历史缓存
             # 签名, 使开/关 UI 都能复用既有生产编译产物。不改 getter: 开关实际仍
             # 按 VLLM_MONITOR / VLLM_TEST_INDEX 原值生效, 这里只归一化 hash 因子:
@@ -467,6 +460,9 @@ def apply() -> None:
             factors.pop("VLLM_FIREFLY_DIRECT", None)
             factors.pop("VLLM_FIREFLY_AR", None)
             factors.pop("VLLM_FIREFLY_DEFER", None)
+            # FIREFLY_TQ 是 tq prefill 路径选择 (FI vs FA2/SDPA), 纯运行时,
+            # 不改编译图 → 同族 pop。
+            factors.pop("VLLM_FIREFLY_TQ", None)
             return factors
 
         _compile_factors_sm75._sm75_wrapped = True  # type: ignore[attr-defined]
