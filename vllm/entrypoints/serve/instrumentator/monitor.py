@@ -15,6 +15,7 @@ Prefill/Decode 吞吐), 由 VLLM_TEST_INDEX 控制 /test 路由, 同默认开/�
 
 import hashlib
 import os
+import re
 import secrets
 import subprocess
 from pathlib import Path
@@ -53,11 +54,44 @@ def _test_index_enabled() -> bool:
         )
 
 
+def _query_pstates() -> dict[str, int | None]:
+    """按 BDF 采每张卡的 P-state(P0=满频活跃, 其余=降频/空闲省电)。
+
+    返回 {bdf_upper: pstate_int|None}。nvidia-smi 的 --query-gpu 无 pstate
+    字段(各驱动版本不一致), 只能解析 `nvidia-smi -q -d PERFORMANCE` 文本:
+    每卡一个 `GPU <BDF>` 块, 块内 `Performance State : P<n>`。BDF 与
+    --query-gpu pci.bus_id 同格式, 供 _query_gpus 配对。
+
+    任何失败返回 {}: P-state 是增强项, 缺失时前端显示「—」, 不拖累主采集。
+    """
+    try:
+        proc = subprocess.run(
+            ["nvidia-smi", "-q", "-d", "PERFORMANCE"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception:  # noqa: BLE001 - 同 _query_gpus 的降级策略
+        return {}
+    if proc.returncode != 0:
+        return {}
+    out: dict[str, int | None] = {}
+    current_bdf: str | None = None
+    for line in proc.stdout.splitlines():
+        m = re.match(r"^\s*GPU\s+([0-9a-fA-F:.]+)\s*$", line)
+        if m:
+            current_bdf = m.group(1).upper()
+            out[current_bdf] = None
+            continue
+        m = re.match(r"^\s*Performance State\s*:\s*P(\d+)\s*$", line)
+        if m and current_bdf is not None:
+            out[current_bdf] = int(m.group(1))
+    return out
+
+
 def _query_gpus() -> dict:
     """nvidia-smi 一次性采集所有 GPU 的瞬时状态(无状态, 每次调用现采)。
 
     返回 {ok:bool, gpus:[{...}], error:str}。前端 /monitor/gpu 轮询本端点
-    拿 GPU 监控数据(温度/显存/功率/频率/PCIe/带宽/ECC/利用率)。
+    拿 GPU 监控数据(温度/显存/功率/频率/PCIe/带宽/ECC/利用率/P-state)。
 
     失败(无 nvidia-smi / 非 NVIDIA / 超时 / 解析异常)时返回 {ok:False,
     gpus:[], error:msg}, 前端据此降级为「GPU 数据不可用」, 绝不抛到路由层
@@ -65,7 +99,7 @@ def _query_gpus() -> dict:
     只要 host 装了驱动即可用, 无需额外权限。
     """
     fields = [
-        "index", "name",
+        "index", "name", "pci.bus_id",
         "temperature.gpu",
         "memory.used", "memory.total",
         "power.draw", "power.limit",
@@ -95,6 +129,10 @@ def _query_gpus() -> dict:
         err = (proc.stderr or proc.stdout or "").strip()
         # 截断避免长报错灌进看板
         return {"ok": False, "gpus": [], "error": err[:200] or f"exit {proc.returncode}"}
+    # P-state: --query-gpu 无此字段(各驱动版本不一致, 有的有有的没有),
+    # 走 `nvidia-smi -q -d PERFORMANCE` 文本, 按 GPU <BDF> 块头配对。
+    # 失败/解析空时各卡 pstate=None, 前端显示「—」, 不影响其余字段。
+    pstate_by_bdf = _query_pstates()
     gpus: list[dict] = []
     for line in proc.stdout.splitlines():
         parts = [p.strip() for p in line.split(",")]
@@ -126,6 +164,8 @@ def _query_gpus() -> dict:
             "mem_bw": _num("utilization.memory"),
             "ecc_s": _num("ecc.errors.corrected.volatile.total"),
             "ecc_d": _num("ecc.errors.uncorrected.volatile.total"),
+            # 原始 P-state 数值(前端显示 P0/P8); 采集失败为 None
+            "pstate": pstate_by_bdf.get(row.get("pci.bus_id", "").upper()),
         })
     if not gpus:
         return {"ok": False, "gpus": [], "error": "no GPU parsed"}
