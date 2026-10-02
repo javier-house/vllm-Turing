@@ -77,6 +77,24 @@ _HAS_FLASH_ATTN = is_flash_attn_varlen_func_available()
 if _HAS_FLASH_ATTN:
     from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
 
+
+# FA2 C++ (mha_varlen_fwd) 只支持 Ampere+ (cc>=8.0); sm75 (T10/2080Ti) 上调用必崩
+# "FlashAttention only supports Ampere GPUs or newer"。import 可用 ≠ 当前卡能跑,
+# _HAS_FLASH_ATTN 只查 import, 这里按当前 GPU 的 compute capability 门控。
+# 懒计算 (首次前向时): 避免模块 import 期建 CUDA context; 结果缓存。
+# sm75 上 FA2 全关 → prefill 走 Firefly TQ FI wrapper (O(N)), 兜底 SDPA。
+_fa2_ok: bool | None = None  # 缓存; 勿与函数同名 (def 会覆盖模块属性)
+
+
+def _fa2_supported() -> bool:
+    """FA2 varlen 在当前 GPU 可用: import 成功且 compute capability >= 8.0。"""
+    global _fa2_ok
+    if _fa2_ok is None:
+        _fa2_ok = False
+        if _HAS_FLASH_ATTN and torch.cuda.is_available():
+            _fa2_ok = torch.cuda.get_device_capability()[0] >= 8
+    return _fa2_ok
+
 # ---------------------------------------------------------------------------
 # Firefly TQ prefill: sm75 (T10, cc7.5) 上 tq KV 的 prefill 走 FlashInfer ragged
 # wrapper (O(N) 显存), 替代 FA2 C++ kernel (mha_varlen_fwd 需 Ampere+, sm75 必崩,
@@ -963,7 +981,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         # Fast path: use flash_attn for first-chunk prefills (all K/V in batch).
         # max_query_len == max_seq_len means no request has prior cached KV.
         # Both are Python ints — no GPU sync.
-        if _HAS_FLASH_ATTN and attn_metadata.max_query_len == attn_metadata.max_seq_len:
+        if _fa2_supported() and attn_metadata.max_query_len == attn_metadata.max_seq_len:
             return self._flash_attn_varlen(
                 q=query,
                 k=key,
@@ -1031,7 +1049,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 )
                 if _fi_first is not None:
                     out = _fi_first.run(q_seq, k_seq, v_seq)
-                elif _HAS_FLASH_ATTN:
+                elif _fa2_supported():
                     # Assign to slice to avoid gpu/cpu sync.
                     self._cu_2[1:2] = q_len
                     cu = self._cu_2
@@ -1300,7 +1318,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         # 右对齐 causal) 直接 run 解量化后的 k_full/v_full, 绕开 FA2/SDPA。
         if flashinfer_wrapper is not None:
             return flashinfer_wrapper.run(query, k_full, v_full)
-        if _HAS_FLASH_ATTN:
+        if _fa2_supported():
             # Reuse pre-allocated cu_seqlens (avoid host→device transfer)
             if not hasattr(self, "_cu_2_q"):
                 self._cu_2_q = torch.zeros(2, device=device, dtype=torch.int32)
