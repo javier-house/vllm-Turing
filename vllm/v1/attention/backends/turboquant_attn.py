@@ -839,8 +839,11 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             # Use the CPU-resident `seq_lens` upper-bound from the metadata
             # (populated in the builder) to compute the prefill sub-batch
             # max without a GPU→CPU sync.
-            if attn_metadata.seq_lens_cpu is not None:
-                prefill_max_seq = int(attn_metadata.seq_lens_cpu[num_decodes:].max())
+            # v0.30.0: seq_lens_cpu 字段已从 CommonAttentionMetadata 移除,
+            # getattr 回退 None (走 max_seq_len 路径, 无 GPU->CPU sync)。
+            _slc = getattr(attn_metadata, "seq_lens_cpu", None)
+            if _slc is not None:
+                prefill_max_seq = int(_slc[num_decodes:].max())
             else:
                 prefill_max_seq = attn_metadata.max_seq_len
             prefill_qsl = (
@@ -861,8 +864,8 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 max_seq_len=prefill_max_seq,
                 is_prefill=True,
                 query_start_loc_cpu=prefill_qsl_cpu,
-                seq_lens_cpu=attn_metadata.seq_lens_cpu[num_decodes:]
-                if attn_metadata.seq_lens_cpu is not None
+                seq_lens_cpu=_slc[num_decodes:]
+                if _slc is not None
                 else None,
                 # Firefly TQ prefill: build 阶段 _plan_tq_fi_wrappers 存的
                 # per-request wrapper, key 已是 prefill 子批下标 (sub_idx =
@@ -1004,8 +1007,10 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             qsl = attn_metadata.query_start_loc_cpu.tolist()
         else:
             qsl = query_start_loc.tolist()
-        if attn_metadata.seq_lens_cpu is not None:
-            seq_lens_list = attn_metadata.seq_lens_cpu.tolist()
+        # v0.30.0: seq_lens_cpu 字段已移除, getattr 回退 None -> 走 GPU seq_lens
+        _slc = getattr(attn_metadata, "seq_lens_cpu", None)
+        if _slc is not None:
+            seq_lens_list = _slc.tolist()
         else:
             seq_lens_list = attn_metadata.seq_lens.tolist()
 

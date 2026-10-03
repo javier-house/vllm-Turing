@@ -292,26 +292,35 @@ __device__ __forceinline__ void exl3_had_tile(
   constexpr int PK_U32_TOTAL = 8 * 8 * PK_U32_TILE;  // s_packed 全部 uint32
   constexpr int STAGE_KSTRIDE = 132;
   constexpr int STAGE_BYTES = 128 * STAGE_KSTRIDE;  // s_stage 字节
-  __shared__ uint8_t s_mem[(PK_U32_TOTAL * 4 > STAGE_BYTES) ? (PK_U32_TOTAL * 4)
-                                                            : STAGE_BYTES];
-  uint32_t* s_packed_u32 = reinterpret_cast<uint32_t*>(s_mem);
-  uint8_t* s_stage_u8 = s_mem;
-  uint32_t* s_stage_u32 = reinterpret_cast<uint32_t*>(s_mem);
-  __shared__ __half2 stile[128 * 64];
+  // 动态共享内存 (extern): s_mem + stile 合计 > sm75 48KB 静态上限
+  // (K=3 时 16896+32768=49664 > 49152), 用 cudaFuncSetAttribute 放开到 96KB。
+  // s_mem 在前, stile 紧随。
+  constexpr int SMEM_SMEM_SIZE =
+      (PK_U32_TOTAL * 4 > STAGE_BYTES) ? (PK_U32_TOTAL * 4) : STAGE_BYTES;
+  constexpr int STILE_BYTES = 128 * 64 * 2 * 2;  // 128*64 __half2 = 32768
+  extern __shared__ uint8_t dyn_smem[];
+  uint32_t* s_packed_u32 = reinterpret_cast<uint32_t*>(dyn_smem);
+  uint8_t* s_stage_u8 = dyn_smem;
+  uint32_t* s_stage_u32 = reinterpret_cast<uint32_t*>(dyn_smem);
+  __half2* stile = reinterpret_cast<__half2*>(dyn_smem + SMEM_SMEM_SIZE);
 
   auto tix = [&](int R, int q, int p) {
     return R * 64 + (q ^ ((R >> 2) & 31)) * 2 + p;
   };
 
-  const int j_int4 = packed_size / 8;
-  for (int u = t; u < 8 * 8 * j_int4; u += RH_THREADS) {
-    const int j = u / (8 * j_int4);
-    const int r = u % (8 * j_int4);
-    const uint16_t* gp =
-        g_packed + ((size_t)((kb * 8 + j) * packed_blocks_n + n)) * packed_size;
-    // s_packed 3 维 [8][8][PK_U32_TILE] -> flat: tile (j,wn=0) 基址 j*8*PK_U32_TILE
-    // (PK_U32_TILE%4==0 保证 int4 16B 对齐)。
-    ((int4*)(s_packed_u32 + j * 8 * PK_U32_TILE))[r] = ((const int4*)gp)[r];
+  // 8 个 wn 子 tile 来自 8 个相邻全局 16×16 tile (列 n..n+7), 各含
+  // PK_U32_TILE 个 uint32。解码器 dq_mul1_4 用 %words 索引这 PK_U32_TILE 个
+  // uint32, 需逐 tile 平拷贝到 s_packed[(j*8+wn)*PK_U32_TILE]。
+  // 标量 uint32 load (4B 对齐: 全局 tile 基址 = (row*N_total+n+wn)*packed_size
+  // uint16 = *32K 字节, K>=1 均 4B 对齐)。
+  for (int u = t; u < 8 * 8 * PK_U32_TILE; u += RH_THREADS) {
+    const int jwn = u / PK_U32_TILE;
+    const int r = u % PK_U32_TILE;
+    const uint32_t* gp32 = reinterpret_cast<const uint32_t*>(
+        g_packed +
+        ((size_t)(kb * 8 + jwn / 8) * packed_blocks_n + n + (jwn % 8)) *
+        packed_size);
+    s_packed_u32[jwn * PK_U32_TILE + r] = gp32[r];
   }
   __syncthreads();
 
@@ -545,14 +554,30 @@ __global__ __launch_bounds__(RH_THREADS) void exl3_quantize_kernel(
 // exl3_decode_to_int8: 同上但 QUANT=true, 解完直接量化+转置写 int8 [n_shard, K]
 //   (每步在线解码用, 预存 c_n, 免 W_hat fp16 临时 + 免 Python 端 .contiguous() 切片)。
 // bits(=bpw) 1..8 直接 switch(不经过泛型 dispatch, 避免 f<1>() 被解析为比较)。
+// 动态共享内存总大小: s_mem(max(s_packed, s_stage)) + stile(128*64*__half2)。
+// s_mem 对 K=1..8 恒为 max(2048K, 16896)=16896; stile=32768; 合计 49664 > 48KB。
+constexpr int EXL3_DYN_SMEM = 16896 + 32768;  // 49664
+
 template <bool QUANT>
 static void launch_decode(
     int bits, dim3 grid, cudaStream_t stream, __half* w_hat, int8_t* out_int8,
     const uint16_t* packed, const __half* suh, const __half* svh,
     const float* c_n, int packed_blocks_n, int nb_offset, int Kdim) {
-#define EXL3_LAUNCH(bits_v)                                        \
-  exl3_decode_kernel<bits_v, QUANT><<<grid, RH_THREADS, 0, stream>>>( \
-      w_hat, out_int8, packed, suh, svh, c_n, packed_blocks_n, nb_offset, Kdim)
+  // 首次调用时放开 smem 上限 (sm75 默认 48KB, 需 49664)。
+  // cudaFuncSetAttribute 幂等, 每次 launch 调也无害 (驱动内部缓存)。
+#define EXL3_LAUNCH(bits_v)                                          \
+  {                                                                  \
+    auto kfn = exl3_decode_kernel<bits_v, QUANT>;                     \
+    static bool attr_set = false;                                     \
+    if (!attr_set) {                                                 \
+      cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, \
+                          EXL3_DYN_SMEM);                             \
+      attr_set = true;                                               \
+    }                                                                \
+    kfn<<<grid, RH_THREADS, EXL3_DYN_SMEM, stream>>>(                 \
+        w_hat, out_int8, packed, suh, svh, c_n, packed_blocks_n,      \
+        nb_offset, Kdim);                                            \
+  }
   switch (bits) {
     case 1: EXL3_LAUNCH(1); break;
     case 2: EXL3_LAUNCH(2); break;

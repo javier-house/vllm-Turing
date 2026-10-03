@@ -26,7 +26,7 @@ exec vllm serve /model \
   --long-prefill-token-threshold 2048 \
   --gpu-memory-utilization 0.90 \
   --mamba-ssm-cache-dtype float32 \
-  --gdn-prefill-backend flashqla_sm75 \
+  --attention-config '{"backend":"FLASHINFER"}' --gdn-prefill-backend flashqla_sm75 \
   --enable-prefix-caching \
   --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE"}' \
   --kv-transfer-config '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":8589934592}}' \

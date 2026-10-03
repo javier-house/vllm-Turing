@@ -108,6 +108,7 @@ LABEL org.opencontainers.image.created="${BUILD_DATE}" \
 
 # 工具(构建期校验 + 运行时 entrypoint / fast_compile 调用)
 COPY docker/install_sm75_overlay.py /opt/vllm-turing/install_sm75_overlay.py
+COPY docker/overlay_injections.py /opt/vllm-turing/overlay_injections.py
 COPY docker/install_speculative.py /opt/vllm-turing/install_speculative.py
 COPY docker/verify_sm75_image.py /opt/vllm-turing/verify_sm75_image.py
 COPY docker/fast_compile.sh /opt/vllm-turing/fast_compile.sh

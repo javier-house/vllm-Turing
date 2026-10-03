@@ -95,8 +95,8 @@ fi
 # 使后续 fast_compile 一律用仓库最新版; 镜像烘焙副本退为离线/不挂载时的兜底。
 # 不复制 entrypoint.sh 自身(正在执行中), 其逻辑变化靠重建镜像生效(极少改)。
 if [[ -d "$WORK/docker" ]]; then
-  for _f in fast_compile.sh install_sm75_overlay.py install_speculative.py \
-            patch_transformers_startup.py verify_sm75_image.py; do
+  for _f in fast_compile.sh install_sm75_overlay.py overlay_injections.py \
+            install_speculative.py patch_transformers_startup.py verify_sm75_image.py; do
     if [[ -f "$WORK/docker/$_f" ]]; then
       cp -f "$WORK/docker/$_f" "/opt/vllm-turing/$_f"
     fi

@@ -419,8 +419,14 @@ class Exl3LinearMethod(QuantizeMethodBase):
             K = layer._exl3_K
             n_shard = s["n_shard"]
             w_hat = torch.empty(K, n_shard, dtype=torch.float16, device=dev)
+            # trellis 是 side stash (非注册 param), vLLM 不自动搬到 GPU。
+            # 显式 .to(dev) 否则 kernel 读 CPU 指针 → IMA。
+            trellis = s["trellis"]
+            if trellis.device != dev:
+                trellis = trellis.to(dev)
+                s["trellis"] = trellis
             mod.exl3_decode(
-                s["trellis"], layer.suh.data[i],
+                trellis, layer.suh.data[i],
                 layer.svh.data[sum(layer._exl3_out_per_rank[:i]):sum(
                     layer._exl3_out_per_rank[:i + 1])],
                 w_hat, 0, n_shard // 16, s["bits"],
@@ -455,6 +461,10 @@ class Exl3LinearMethod(QuantizeMethodBase):
     ) -> torch.Tensor:
         # @torch.compiler.disable: apply 内含 os.path (cu 懒加载) + 自定义 CUDA kernel
         # (mod.exl3_decode_to_int8) + per-shard 循环, torch.compile (dynamo) 无法 trace。
+        # 注: 该标记只对 inductor (VLLM_COMPILE) 路径生效; breakable-cudagraph
+        # (VLLM_USE_BREAKABLE_CUDAGRAPH=1, 无 inductor) 直接跑 Python, 此标记 inert,
+        # EXL3 GEMM 作为普通可捕获 kernel 进图 (非 eager 断点, 因 apply 返回新张量
+        # 不满足 eager_break 的 in-place 约束)。
         mod = _load_exl3_cuda_mod()
         if mod is None:
             raise RuntimeError("firefly_exl3 CUDA kernel 未加载, 无法在线解码")
@@ -568,7 +578,12 @@ class Exl3EmbeddingMethod(QuantizeMethodBase):
         K = layer._exl3_K
         n_shard = s["n_shard"]
         w_hat = torch.empty(K, n_shard, dtype=torch.float16, device=dev)
-        mod.exl3_decode(s["trellis"], layer.suh.data, layer.svh.data, w_hat,
+        # trellis side stash 不自动上 GPU, 显式搬 (否则 kernel 读 CPU 指针 IMA)
+        trellis = s["trellis"]
+        if trellis.device != dev:
+            trellis = trellis.to(dev)
+            s["trellis"] = trellis
+        mod.exl3_decode(trellis, layer.suh.data, layer.svh.data, w_hat,
                         0, n_shard // 16, s["bits"])
         s["c_n"] = (w_hat.abs().amax(dim=0) / 127.0).float().contiguous()
         s["suh"] = layer.suh.data
